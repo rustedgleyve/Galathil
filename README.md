@@ -17,6 +17,7 @@ Optional features include bringing over custom skin textures, custom bodies, and
 ## Output Settings
 
 Choose **Galathil Output + SkyPatcher** to add or update NPC appearance mappings in one MO2 mod. Galathil creates the output ESPFE plugin(s), a combined SkyPatcher config, and notes that identify the asset mods used by each source ESP.
+
 The other option is to directly replace the existing ESP of the replacer.
 
 Each linked replacer mod stays enabled so the game can use its face and body assets. Galathil disables that mod's source ESP in the selected profile when no active plugin depends on it, the output does not need it as a master, and any older Galathil routes have been migrated. The source ESP file stays inside the asset mod so Galathil can read the replacer and recover its appearance later. If another plugin, output record, or unmigrated route needs the source ESP, Galathil leaves it enabled and explains why.
