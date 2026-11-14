@@ -9,7 +9,7 @@
     <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
     <PublishSingleFile>false</PublishSingleFile>
     <SelfContained>false</SelfContained>
-    <Version>1.0.0</Version>
+    <Version>1.1.0</Version>
     <AssemblyTitle>Galathil</AssemblyTitle>
     <Product>Simple NPC Replacer Swapper</Product>
     <Description>Simple NPC Replacer swapper for Skyrim Special Edition.</Description>

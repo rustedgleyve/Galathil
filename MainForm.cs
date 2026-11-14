@@ -8,6 +8,7 @@ internal sealed class MainForm : Form
     private readonly TextBox _instancePath = new() { Dock = DockStyle.Fill };
     private readonly ComboBox _profiles = new() { DropDownStyle = ComboBoxStyle.DropDownList, Dock = DockStyle.Fill };
     private readonly TextBox _sourceSearch = new() { PlaceholderText = "Search characters changed by this mod...", Dock = DockStyle.Fill };
+    private readonly Button _clearSource = new() { Text = "Clear look", Dock = DockStyle.Fill, Margin = new Padding(4, 0, 0, 0) };
     private readonly TextBox _modSearch = new() { PlaceholderText = "Search mods...", Dock = DockStyle.Fill };
     private readonly ListBox _mods = new() { Dock = DockStyle.Fill, DrawMode = DrawMode.OwnerDrawFixed, ItemHeight = 23 };
     private readonly ComboBox _plugins = new() { DropDownStyle = ComboBoxStyle.DropDownList, Dock = DockStyle.Fill };
@@ -15,33 +16,43 @@ internal sealed class MainForm : Form
     private readonly TextBox _targetSearch = new() { PlaceholderText = "Search characters by name or ID...", Dock = DockStyle.Fill };
     private readonly ListView _targetList = new BufferedListView { Dock = DockStyle.Fill, View = View.Details, FullRowSelect = true, MultiSelect = false, VirtualMode = true, ShowItemToolTips = true };
     private readonly DataGridView _mappingGrid = CreateGrid();
-    private readonly ComboBox _outputMode = new() { DropDownStyle = ComboBoxStyle.DropDownList, Width = 180 };
+    private readonly TextBox _outfitSearch = new() { PlaceholderText = "Search outfits, then choose one below...", Dock = DockStyle.Fill };
+    private readonly ComboBox _outfitCatalog = new() { DropDownStyle = ComboBoxStyle.DropDownList, Dock = DockStyle.Fill };
+    private readonly ComboBox _outputMode = new() { DropDownStyle = ComboBoxStyle.DropDownList, Dock = DockStyle.Fill };
     private readonly CheckBox _copySkin = new() { Text = "", AutoSize = true, Checked = false, Enabled = false, Margin = new Padding(0, 3, 2, 0) };
     private readonly CheckBox _copyBody = new() { Text = "", AutoSize = true, Checked = false, Enabled = false, Margin = new Padding(0, 3, 2, 0) };
-    private readonly CheckBox _copyOutfit = new() { Text = "", AutoSize = true, Checked = false, Enabled = false, Margin = new Padding(0, 3, 2, 0) };
+    private readonly CheckBox _replaceOutfit = new() { Text = "", AutoSize = true, Checked = false, Enabled = false, Margin = new Padding(0, 3, 2, 0) };
+    private readonly CheckBox _addOutfit = new() { Text = "", AutoSize = true, Checked = false, Margin = new Padding(0, 3, 2, 0) };
     private readonly Label _skinOptionText = new() { Text = "Skin", AutoSize = true, ForeColor = Color.White };
     private readonly Label _bodyOptionText = new() { Text = "Body", AutoSize = true, ForeColor = Color.White };
-    private readonly Label _outfitOptionText = new() { Text = "New outfit", AutoSize = true, ForeColor = Color.White };
+    private readonly Label _replaceOutfitText = new() { Text = "Replace Outfit", AutoSize = true, ForeColor = Color.White };
+    private readonly Label _addOutfitText = new() { Text = "Add Outfit", AutoSize = true, ForeColor = Color.White };
     private readonly ToolTip _optionsToolTip = new();
     private readonly ToolStripStatusLabel _statusText = new() { Text = "Choose a MO2 profile and source mod.", AutoSize = false, Spring = true, TextAlign = ContentAlignment.MiddleLeft };
     private readonly ToolStripProgressBar _progress = new() { Visible = false, Style = ProgressBarStyle.Marquee, Width = 120 };
     private readonly List<ModListEntry> _allMods = [];
     private readonly List<TargetNpc> _allTargets = [];
+    private readonly List<ModOutfit> _allOutfits = [];
+    private readonly List<OutfitAssignmentRow> _outfitAssignments = [];
     private TargetNpc[] _visibleTargets = [];
+    private ModOutfit[] _visibleOutfits = [];
     private readonly List<NpcReplacement> _sourceNpcs = [];
     private NpcReplacement[] _visibleSourceNpcs = [];
     private readonly List<MappingRow> _mappings = [];
+    private TargetNpc[] _mappingGridTargets = [];
     private readonly Dictionary<string, AppearanceAssignment> _savedOutputAssignmentsBySource = new(StringComparer.OrdinalIgnoreCase);
     private ProfileContext? _context;
     private bool _binding;
+    private bool _updatingOptions;
+    private bool _sourceClearedByUser;
     private int _loadGeneration;
 
     public MainForm(string? initialInstance = null)
     {
         Text = "Galathil";
         AutoScaleMode = AutoScaleMode.Dpi;
-        MinimumSize = new System.Drawing.Size(1320, 620);
-        Size = new System.Drawing.Size(1320, 680);
+        MinimumSize = new System.Drawing.Size(1320, 760);
+        Size = new System.Drawing.Size(1480, 900);
         StartPosition = FormStartPosition.CenterScreen;
         SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
 
@@ -59,10 +70,10 @@ internal sealed class MainForm : Form
             ("Source NPC", "Npc"),
             ("Plugin ID", "EditorID"),
             ("Replaces", "CurrentTarget"));
-        var root = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 3, Padding = new Padding(8) };
+        ConfigureGrid(_mappingGrid, ("Look from (optional)", "Source"), ("Apply to", "Target"), ("Outfit", "Outfit"));
+        var root = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 2, Padding = new Padding(8) };
         root.RowStyles.Add(new RowStyle(SizeType.Absolute, 46));
         root.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
-        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 230));
         Controls.Add(root);
 
         var top = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 6, RowCount = 1 };
@@ -85,17 +96,19 @@ internal sealed class MainForm : Form
         top.Controls.Add(refresh, 5, 0);
         root.Controls.Add(top, 0, 0);
 
-        var mainSplit = new SplitContainer { Size = new System.Drawing.Size(1220, 500), Dock = DockStyle.Fill, Orientation = Orientation.Vertical, Panel1MinSize = 210, Panel2MinSize = 610, SplitterWidth = 5, SplitterDistance = 370 };
-        mainSplit.Panel1.Controls.Add(BuildModPanel());
-        var detailSplit = new SplitContainer { Size = new System.Drawing.Size(840, 500), Dock = DockStyle.Fill, Orientation = Orientation.Vertical, Panel1MinSize = 290, Panel2MinSize = 290, SplitterWidth = 5, SplitterDistance = 400 };
-        detailSplit.Panel1.Controls.Add(BuildSourcePanel());
-        detailSplit.Panel2.Controls.Add(BuildTargetPanel());
-        mainSplit.Panel2.Controls.Add(detailSplit);
-        MakeResponsive(mainSplit, 0.30);
-        MakeResponsive(detailSplit, 0.46);
-        root.Controls.Add(mainSplit, 0, 1);
-
-        root.Controls.Add(BuildMappingPanel(), 0, 2);
+        var columns = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 3, RowCount = 1, Padding = new Padding(0, 8, 0, 0) };
+        columns.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 25));
+        columns.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 39));
+        columns.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 36));
+        columns.Controls.Add(BuildModPanel(), 0, 0);
+        var center = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 2, Padding = new Padding(6, 0, 6, 0) };
+        center.RowStyles.Add(new RowStyle(SizeType.Percent, 56));
+        center.RowStyles.Add(new RowStyle(SizeType.Percent, 44));
+        center.Controls.Add(BuildSourcePanel(), 0, 0);
+        center.Controls.Add(BuildTargetPanel(), 0, 1);
+        columns.Controls.Add(center, 1, 0);
+        columns.Controls.Add(BuildOutputPanel(), 2, 0);
+        root.Controls.Add(columns, 0, 1);
         var strip = new StatusStrip();
         strip.Items.Add(_statusText);
         strip.Items.Add(_progress);
@@ -112,7 +125,12 @@ internal sealed class MainForm : Form
         panel.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
         panel.Controls.Add(new Label { Text = "Characters changed by this mod", AutoSize = true, ForeColor = SystemColors.GrayText }, 0, 0);
         panel.Controls.Add(_plugins, 0, 1);
-        panel.Controls.Add(_sourceSearch, 0, 2);
+        var sourceSearchRow = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, RowCount = 1, Margin = new Padding(0) };
+        sourceSearchRow.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        sourceSearchRow.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 86));
+        sourceSearchRow.Controls.Add(_sourceSearch, 0, 0);
+        sourceSearchRow.Controls.Add(_clearSource, 1, 0);
+        panel.Controls.Add(sourceSearchRow, 0, 2);
 
         var records = new GroupBox { Text = "Characters changed in this plugin", Dock = DockStyle.Fill };
         records.Controls.Add(_sourceGrid);
@@ -134,11 +152,11 @@ internal sealed class MainForm : Form
 
     private Control BuildTargetPanel()
     {
-        var panel = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 3 };
+        var panel = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 3, Padding = new Padding(0, 6, 0, 0) };
         panel.RowStyles.Add(new RowStyle(SizeType.Absolute, 26));
         panel.RowStyles.Add(new RowStyle(SizeType.Absolute, 32));
         panel.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
-        panel.Controls.Add(new Label { Text = "Character who receives the look", AutoSize = true, ForeColor = SystemColors.GrayText }, 0, 0);
+        panel.Controls.Add(new Label { Text = "Recipient", AutoSize = true, ForeColor = SystemColors.GrayText }, 0, 0);
         panel.Controls.Add(_targetSearch, 0, 1);
         _targetList.Columns.Add("NPC", 150);
         _targetList.Columns.Add("ID", 100);
@@ -150,52 +168,62 @@ internal sealed class MainForm : Form
         return panel;
     }
 
-    private Control BuildMappingPanel()
+    private Control BuildOutputPanel()
     {
-        var panel = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, RowCount = 2, Padding = new Padding(0, 6, 0, 0) };
-        panel.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
-        panel.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 220));
-        panel.RowStyles.Add(new RowStyle(SizeType.Absolute, 38));
-        panel.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
-        var header = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, RowCount = 1 };
-        header.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
-        header.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 400));
-        header.Controls.Add(new Label { Text = "Replacer look -> character receiving it", AutoSize = true, ForeColor = SystemColors.GrayText, Anchor = AnchorStyles.Left }, 0, 0);
-        var outputControls = new FlowLayoutPanel { Dock = DockStyle.Fill, FlowDirection = FlowDirection.LeftToRight, WrapContents = false, Margin = new Padding(0), Padding = new Padding(2, 3, 0, 0) };
-        outputControls.Controls.Add(new Label { Text = "Output:", AutoSize = true, ForeColor = Color.White, Margin = new Padding(0, 5, 5, 0) });
-        _outputMode.Width = 205;
-        outputControls.Controls.Add(_outputMode);
-        var create = new Button { Text = "Apply look", Width = 132, Height = 28, Margin = new Padding(6, 0, 0, 0) };
-        create.Click += async (_, _) => await CreateModAsync();
-        outputControls.Controls.Add(create);
-        header.Controls.Add(outputControls, 1, 0);
-        panel.Controls.Add(header, 0, 0);
-        panel.SetColumnSpan(header, 2);
-        ConfigureGrid(_mappingGrid, ("Look from", "Source"), ("Apply to", "Target"));
-        panel.Controls.Add(_mappingGrid, 0, 1);
-        var buttons = new FlowLayoutPanel { Dock = DockStyle.Fill, FlowDirection = FlowDirection.TopDown, WrapContents = false, Margin = new Padding(0), Padding = new Padding(4, 0, 0, 0) };
-        var add = new Button { Text = "Add mapping", Width = 200, Height = 28 };
-        add.Click += (_, _) => AddMapping();
-        var remove = new Button { Text = "Remove mapping", Width = 200, Height = 28 };
-        remove.Click += (_, _) => RemoveMapping();
-        _outputMode.Items.AddRange(["Galathil Output + SkyPatcher", "Replace source ESP", "Same ESP + SkyPatcher"]);
+        var panel = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 3, Padding = new Padding(4, 0, 0, 0) };
+        panel.RowStyles.Add(new RowStyle(SizeType.Percent, 48));
+        panel.RowStyles.Add(new RowStyle(SizeType.Absolute, 180));
+        panel.RowStyles.Add(new RowStyle(SizeType.Percent, 52));
+
+        var mappings = new GroupBox { Text = "Mappings", Dock = DockStyle.Fill, ForeColor = Color.White };
+        mappings.Controls.Add(_mappingGrid);
+        panel.Controls.Add(mappings, 0, 0);
+
+        var options = new GroupBox { Text = "Options", Dock = DockStyle.Fill, ForeColor = Color.White };
+        var optionsGrid = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, RowCount = 4, Padding = new Padding(4) };
+        optionsGrid.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50));
+        optionsGrid.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50));
+        optionsGrid.RowStyles.Add(new RowStyle(SizeType.Absolute, 30));
+        optionsGrid.RowStyles.Add(new RowStyle(SizeType.Absolute, 30));
+        optionsGrid.RowStyles.Add(new RowStyle(SizeType.Absolute, 30));
+        optionsGrid.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        var outputType = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, RowCount = 1 };
+        outputType.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 82));
+        outputType.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        outputType.Controls.Add(new Label { Text = "Output type", Dock = DockStyle.Fill, TextAlign = ContentAlignment.MiddleLeft, ForeColor = Color.White }, 0, 0);
+        _outputMode.Items.AddRange(["Galathil Output + SkyPatcher", "Replace source ESP"]);
         _outputMode.SelectedIndex = 0;
-        var optional = new GroupBox { Text = "Optional", Width = 210, Height = 80, ForeColor = Color.White };
-        var optionalGrid = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, RowCount = 2, Padding = new Padding(3) };
-        optionalGrid.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50));
-        optionalGrid.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50));
-        optionalGrid.RowStyles.Add(new RowStyle(SizeType.Percent, 50));
-        optionalGrid.RowStyles.Add(new RowStyle(SizeType.Percent, 50));
-        optionalGrid.Controls.Add(CreateOptionalOption(_copySkin, _skinOptionText), 0, 0);
-        optionalGrid.Controls.Add(CreateOptionalOption(_copyBody, _bodyOptionText), 1, 0);
-        var outfitOption = CreateOptionalOption(_copyOutfit, _outfitOptionText);
-        optionalGrid.Controls.Add(outfitOption, 0, 1);
-        optionalGrid.SetColumnSpan(outfitOption, 2);
-        optional.Controls.Add(optionalGrid);
-        buttons.Controls.Add(add);
-        buttons.Controls.Add(remove);
-        buttons.Controls.Add(optional);
-        panel.Controls.Add(buttons, 1, 1);
+        outputType.Controls.Add(_outputMode, 1, 0);
+        optionsGrid.Controls.Add(outputType, 0, 0);
+        optionsGrid.SetColumnSpan(outputType, 2);
+        optionsGrid.Controls.Add(CreateOptionalOption(_copySkin, _skinOptionText), 0, 1);
+        optionsGrid.Controls.Add(CreateOptionalOption(_copyBody, _bodyOptionText), 1, 1);
+        optionsGrid.Controls.Add(CreateOptionalOption(_replaceOutfit, _replaceOutfitText), 0, 2);
+        optionsGrid.Controls.Add(CreateOptionalOption(_addOutfit, _addOutfitText), 1, 2);
+        var outfitChoicePanel = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 2, Margin = new Padding(0), Padding = new Padding(0) };
+        outfitChoicePanel.RowStyles.Add(new RowStyle(SizeType.Absolute, 28));
+        outfitChoicePanel.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        outfitChoicePanel.Controls.Add(_outfitSearch, 0, 0);
+        outfitChoicePanel.Controls.Add(_outfitCatalog, 0, 1);
+        optionsGrid.Controls.Add(outfitChoicePanel, 0, 3);
+        optionsGrid.SetColumnSpan(outfitChoicePanel, 2);
+        options.Controls.Add(optionsGrid);
+        panel.Controls.Add(options, 0, 1);
+
+        var buttons = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 3, Padding = new Padding(0, 5, 0, 0) };
+        buttons.RowStyles.Add(new RowStyle(SizeType.Percent, 33.33f));
+        buttons.RowStyles.Add(new RowStyle(SizeType.Percent, 33.33f));
+        buttons.RowStyles.Add(new RowStyle(SizeType.Percent, 33.34f));
+        var add = new Button { Text = "Add Mapping", Dock = DockStyle.Fill, Margin = new Padding(0, 2, 0, 2) };
+        add.Click += (_, _) => AddMapping();
+        var remove = new Button { Text = "Remove Mapping", Dock = DockStyle.Fill, Margin = new Padding(0, 2, 0, 2) };
+        remove.Click += (_, _) => RemoveMapping();
+        var apply = new Button { Text = "Apply Look", Dock = DockStyle.Fill, Margin = new Padding(0, 2, 0, 2) };
+        apply.Click += async (_, _) => await CreateModAsync();
+        buttons.Controls.Add(add, 0, 0);
+        buttons.Controls.Add(remove, 0, 1);
+        buttons.Controls.Add(apply, 0, 2);
+        panel.Controls.Add(buttons, 0, 2);
         return panel;
     }
 
@@ -230,6 +258,27 @@ internal sealed class MainForm : Form
             };
         };
         _targetList.DoubleClick += (_, _) => AddMapping();
+        _sourceGrid.SelectionChanged += (_, _) =>
+        {
+            if (_sourceGrid.SelectedRows.Count > 0) _sourceClearedByUser = false;
+            UpdateOptionalOptions();
+        };
+        _mappingGrid.SelectionChanged += (_, _) => UpdateOptionalOptions();
+        _clearSource.Click += (_, _) =>
+        {
+            _sourceClearedByUser = true;
+            _sourceGrid.ClearSelection();
+            _sourceGrid.CurrentCell = null;
+            UpdateOptionalOptions();
+            SetStatus("Look selection cleared. Add an outfit mapping without transferring a look.");
+        };
+        _optionsToolTip.SetToolTip(_clearSource, "Clear the selected look source so Add Mapping can add an outfit by itself.");
+        _replaceOutfit.CheckedChanged += (_, _) => UpdateOptionalOptions();
+        _addOutfit.CheckedChanged += (_, _) => UpdateOptionalOptions();
+        _outfitSearch.TextChanged += (_, _) => FilterOutfits();
+        _outfitCatalog.SelectedIndexChanged += (_, _) => UpdateOptionalOptions();
+        _outputMode.SelectedIndexChanged += (_, _) => UpdateOptionalOptions();
+        _targetList.SelectedIndexChanged += (_, _) => UpdateOptionalOptions();
     }
 
     private async Task LoadProfilesAsync()
@@ -268,12 +317,21 @@ internal sealed class MainForm : Form
             _allMods.AddRange(context.Mods);
             _allTargets.Clear();
             _allTargets.AddRange(scan.Npcs);
+            _allOutfits.Clear();
+            _allOutfits.AddRange(scan.Outfits);
             _mappings.Clear();
+            _outfitAssignments.Clear();
+            _sourceClearedByUser = false;
             _savedOutputAssignmentsBySource.Clear();
+            _updatingOptions = true;
+            _replaceOutfit.Checked = false;
+            _addOutfit.Checked = false;
+            _updatingOptions = false;
             var planIssue = LoadGalathilOutputPlan(context);
             _mods.SelectedIndex = -1;
             FilterMods();
             FilterTargets();
+            FilterOutfits();
             RefreshMappingGrid();
             _sourceGrid.Rows.Clear();
             _plugins.Items.Clear();
@@ -295,7 +353,7 @@ internal sealed class MainForm : Form
         var selectedName = (_mods.SelectedItem as ModListEntry)?.Name;
         _mods.BeginUpdate();
         _mods.Items.Clear();
-        foreach (var mod in _allMods)
+        foreach (var mod in _allMods.AsEnumerable().Reverse())
         {
             if (mod.IsSeparator)
             {
@@ -318,7 +376,18 @@ internal sealed class MainForm : Form
             if (manifest is null || manifest.Version != 1) return "Galathil Output has an unsupported or empty saved plan.";
             _copySkin.Checked = manifest.CopySkin;
             _copyBody.Checked = manifest.CopyBody;
-            _copyOutfit.Checked = manifest.CopyOutfit;
+            _replaceOutfit.Checked = manifest.CopyOutfit;
+            if (manifest.OutfitAssignments is not null)
+                foreach (var assignment in manifest.OutfitAssignments)
+                {
+                    var outfit = _allOutfits.FirstOrDefault(o => o.FormKeyText.Equals(assignment.OutfitFormKey, StringComparison.OrdinalIgnoreCase))
+                        ?? new ModOutfit(assignment.OutfitName, assignment.OutfitFormKey, assignment.OutfitPlugin,
+                            assignment.OutfitPlugin, assignment.OutfitModName);
+                    var target = _allTargets.FirstOrDefault(n => n.FormKeyText.Equals(assignment.TargetFormKey, StringComparison.OrdinalIgnoreCase))
+                        ?? new TargetNpc(assignment.TargetName, "", assignment.TargetFormKey,
+                            assignment.TargetFormKey.Split('|')[0], "", false);
+                    _outfitAssignments.Add(new OutfitAssignmentRow(target with { Name = assignment.TargetName }, outfit));
+                }
             foreach (var assignment in manifest.Assignments)
             {
                 _savedOutputAssignmentsBySource[SavedAssignmentKey(assignment.SourceMod, assignment.SourcePlugin, assignment.SourceFormKey)] = assignment;
@@ -332,6 +401,16 @@ internal sealed class MainForm : Form
                     var separator = assignment.TargetFormKey.LastIndexOf('|');
                     var plugin = separator < 0 ? "" : assignment.TargetFormKey[..separator];
                     target = new TargetNpc(assignment.TargetName, "", assignment.TargetFormKey, plugin, "", false);
+                }
+                // Migrate the previous per-look outfit choice into the new independent outfit list.
+                if (!string.IsNullOrWhiteSpace(assignment.ProvidedOutfitFormKey) &&
+                    !_outfitAssignments.Any(o => o.Target.FormKeyText.Equals(assignment.TargetFormKey, StringComparison.OrdinalIgnoreCase)))
+                {
+                    var oldOutfit = _allOutfits.FirstOrDefault(o => o.FormKeyText.Equals(assignment.ProvidedOutfitFormKey, StringComparison.OrdinalIgnoreCase))
+                        ?? new ModOutfit(assignment.ProvidedOutfitName ?? assignment.ProvidedOutfitFormKey,
+                            assignment.ProvidedOutfitFormKey, assignment.ProvidedOutfitPlugin ?? assignment.SourcePlugin,
+                            assignment.ProvidedOutfitPlugin ?? assignment.SourcePlugin, assignment.SourceMod);
+                    _outfitAssignments.Add(new OutfitAssignmentRow(target with { Name = assignment.TargetName }, oldOutfit));
                 }
                 _mappings.Add(new MappingRow(assignment.SourceMod, assignment.SourcePlugin, source,
                     target with { Name = assignment.TargetName }));
@@ -397,9 +476,6 @@ internal sealed class MainForm : Form
                     {
                         RaceKey = saved.SourceRaceKey ?? n.RaceKey,
                         IsFemale = saved.SourceIsFemale,
-                        HasCustomSkin = saved.HasCustomSkin,
-                        HasCustomBody = saved.HasCustomBody,
-                        HasNewOutfit = saved.HasNewOutfit,
                         AppearancePlugin = saved.AppearancePlugin,
                         AppearanceFormKey = saved.AppearanceFormKey,
                         ExistingTargetFormKey = saved.TargetFormKey,
@@ -408,6 +484,15 @@ internal sealed class MainForm : Form
                     : n).ToList());
             _sourceNpcs.Clear();
             _sourceNpcs.AddRange(npcs);
+            for (var i = 0; i < _mappings.Count; i++)
+            {
+                var mapping = _mappings[i];
+                if (!mapping.ModName.Equals(sourceModName, StringComparison.OrdinalIgnoreCase) ||
+                    !mapping.Plugin.Equals(plugin.Name, StringComparison.OrdinalIgnoreCase)) continue;
+                var refreshedSource = npcs.FirstOrDefault(n => n.OriginalFormKey.Equals(mapping.Source.OriginalFormKey, StringComparison.OrdinalIgnoreCase));
+                if (refreshedSource is not null) _mappings[i] = mapping with { Source = refreshedSource };
+            }
+            RefreshMappingGrid();
             FilterSourceNpcs();
             SetBusy(false, npcs.Count == 0
                 ? $"No NPC records found in {plugin.Name}."
@@ -461,19 +546,30 @@ internal sealed class MainForm : Form
 
     private void AddMapping()
     {
-        if (_sourceGrid.CurrentRow?.Tag is not NpcReplacement source)
+        var source = SelectedSource();
+        var addOutfit = _addOutfit.Checked;
+        if (source is null && !addOutfit)
         {
-            SetStatus("Select a source NPC override first.");
+            SetStatus("Select a look source, or tick Add Outfit to create an outfit-only mapping.");
             return;
         }
-        if (!source.IsDirectOverride)
+        if (source is not null && !source.IsDirectOverride)
         {
-            SetStatus("That record is newly added by the mod, not an override of an existing NPC. Choose an override record.");
+            SetStatus("That character was added by the mod, rather than replacing an existing one. Choose an override record or clear the look selection to add an outfit only.");
+            return;
+        }
+        if (addOutfit && _outputMode.SelectedIndex != 0)
+        {
+            SetStatus("Adding an outfit requires Galathil Output + SkyPatcher. Choose that output type first.");
             return;
         }
 
-        TargetNpc? target;
-        if (_targetList.SelectedIndices.Count == 0)
+        TargetNpc target;
+        if (_targetList.SelectedIndices.Count > 0)
+        {
+            target = _visibleTargets[_targetList.SelectedIndices[0]];
+        }
+        else if (source is not null)
         {
             _outputMode.SelectedIndex = 0;
             if (!string.IsNullOrWhiteSpace(source.ExistingRouteProblem))
@@ -482,96 +578,219 @@ internal sealed class MainForm : Form
                 return;
             }
             var targetKey = source.ExistingTargetFormKey ?? source.OriginalFormKey;
-            target = _allTargets.FirstOrDefault(n => n.FormKeyText.Equals(targetKey, StringComparison.OrdinalIgnoreCase));
-            if (target is null)
+            var defaultTarget = _allTargets.FirstOrDefault(n => n.FormKeyText.Equals(targetKey, StringComparison.OrdinalIgnoreCase));
+            if (defaultTarget is null)
             {
                 SetStatus($"Could not find the default recipient {targetKey} in this profile. Select a recipient from the list.");
                 return;
             }
+            target = defaultTarget;
         }
-        else target = _visibleTargets[_targetList.SelectedIndices[0]];
+        else
+        {
+            SetStatus("Select the character who should receive this outfit.");
+            return;
+        }
 
-        if (source.OriginalFormKey.Equals(target.FormKeyText, StringComparison.OrdinalIgnoreCase) && _outputMode.SelectedIndex != 0)
+        var outfit = addOutfit ? _outfitCatalog.SelectedItem as ModOutfit : null;
+        if (addOutfit && outfit is null)
+        {
+            SetStatus("Choose an Outfit record from an enabled mod first.");
+            return;
+        }
+
+        if (source is not null && source.OriginalFormKey.Equals(target.FormKeyText, StringComparison.OrdinalIgnoreCase) && _outputMode.SelectedIndex != 0)
         {
             SetStatus("The target is the NPC this replacer already overrides. Choose a different target to redirect it.");
             return;
         }
-        if (_mappings.Any(m => m.Target.FormKeyText.Equals(target.FormKeyText, StringComparison.OrdinalIgnoreCase)))
+        var existingLook = _mappings.FirstOrDefault(m => m.Target.FormKeyText.Equals(target.FormKeyText, StringComparison.OrdinalIgnoreCase));
+        var addedLook = false;
+        if (source is not null && existingLook is not null &&
+            (!existingLook.ModName.Equals((_mods.SelectedItem as ModListEntry)?.Name ?? "", StringComparison.OrdinalIgnoreCase) ||
+             !existingLook.Plugin.Equals((_plugins.SelectedItem as PluginChoice)?.Name ?? "", StringComparison.OrdinalIgnoreCase) ||
+             !existingLook.Source.OriginalFormKey.Equals(source.OriginalFormKey, StringComparison.OrdinalIgnoreCase)))
         {
-            SetStatus($"{target.Name} already has an appearance assigned. Remove that assignment first.");
+            SetStatus($"{target.Name} already has a different look assigned. Remove its mapping first.");
             return;
         }
-        var modName = (_mods.SelectedItem as ModListEntry)?.Name ?? "";
-        if (_plugins.SelectedItem is not PluginChoice plugin)
+        if (source is not null && existingLook is null)
         {
-            SetStatus("Select the replacer's plugin first.");
+            var modName = (_mods.SelectedItem as ModListEntry)?.Name ?? "";
+            if (_plugins.SelectedItem is not PluginChoice plugin)
+            {
+                SetStatus("Select the replacer's plugin first.");
+                return;
+            }
+            if (_mappings.Any(m => m.ModName.Equals(modName, StringComparison.OrdinalIgnoreCase) &&
+                                   m.Plugin.Equals(plugin.Name, StringComparison.OrdinalIgnoreCase) &&
+                                   m.Source.OriginalFormKey.Equals(source.OriginalFormKey, StringComparison.OrdinalIgnoreCase)))
+            {
+                SetStatus("This look source already has a mapping. Remove its existing mapping before assigning it to a different character.");
+                return;
+            }
+            _mappings.Add(new MappingRow(modName, plugin.Name, source, target));
+            addedLook = true;
+        }
+
+        var addedOutfit = false;
+        if (outfit is not null)
+        {
+            var existingOutfit = _outfitAssignments.FirstOrDefault(row => row.Target.FormKeyText.Equals(target.FormKeyText, StringComparison.OrdinalIgnoreCase));
+            if (existingOutfit is not null && !existingOutfit.Outfit.FormKeyText.Equals(outfit.FormKeyText, StringComparison.OrdinalIgnoreCase))
+            {
+                SetStatus($"{target.Name} already has a different outfit assigned. Remove its mapping first.");
+                if (addedLook) _mappings.RemoveAll(m => m.Target.FormKeyText.Equals(target.FormKeyText, StringComparison.OrdinalIgnoreCase));
+                return;
+            }
+            if (existingOutfit is null)
+            {
+                _outfitAssignments.Add(new OutfitAssignmentRow(target, outfit));
+                addedOutfit = true;
+            }
+        }
+
+        if (!addedLook && !addedOutfit)
+        {
+            SetStatus($"{target.Name} already has this mapping.");
             return;
         }
-        if (_mappings.Any(m => m.ModName.Equals(modName, StringComparison.OrdinalIgnoreCase) && m.Plugin.Equals(plugin.Name, StringComparison.OrdinalIgnoreCase) && m.Source.OriginalFormKey == source.OriginalFormKey))
-        {
-            SetStatus("A mapping for this source record is already in the plan.");
-            return;
-        }
-        _mappings.Add(new MappingRow(modName, plugin.Name, source, target));
         RefreshMappingGrid();
-        SetStatus($"Added {source.OverriddenNpcName} → {target.Name} to the Galathil Output plan. Click Apply look to update the shared SkyPatcher output.");
+        var displayIndex = Array.FindIndex(_mappingGridTargets, row => row.FormKeyText.Equals(target.FormKeyText, StringComparison.OrdinalIgnoreCase));
+        if (displayIndex >= 0) _mappingGrid.CurrentCell = _mappingGrid.Rows[displayIndex].Cells[0];
+        if (addedLook && addedOutfit)
+            SetStatus($"Added {source!.OverriddenNpcName} and {outfit!.Name} → {target.Name}. Click Apply Look to update Galathil Output.");
+        else if (addedOutfit && existingLook is not null)
+            SetStatus($"Added {outfit!.Name} to {target.Name}'s mapping. Click Apply Look to update Galathil Output.");
+        else if (addedOutfit)
+            SetStatus($"Added outfit-only mapping: {outfit!.Name} → {target.Name}. Click Apply Look to update Galathil Output.");
+        else
+            SetStatus($"Added {source!.OverriddenNpcName} → {target.Name}. Click Apply Look to update Galathil Output.");
     }
 
     private void RemoveMapping()
     {
-        var row = _mappingGrid.CurrentRow?.Index ?? -1;
-        if (row >= 0 && row < _mappings.Count)
+        var target = SelectedMappingTarget();
+        if (target is null)
         {
-            _mappings.RemoveAt(row);
-            RefreshMappingGrid();
+            SetStatus("Select a mapping to remove first.");
+            return;
         }
+        var key = target.FormKeyText;
+        var removedLooks = _mappings.RemoveAll(m => m.Target.FormKeyText.Equals(key, StringComparison.OrdinalIgnoreCase));
+        var removedOutfits = _outfitAssignments.RemoveAll(m => m.Target.FormKeyText.Equals(key, StringComparison.OrdinalIgnoreCase));
+        RefreshMappingGrid();
+        SetStatus(removedLooks > 0 && removedOutfits > 0
+            ? $"Removed the look and outfit mapping for {target.Name}."
+            : removedOutfits > 0 ? $"Removed the outfit mapping for {target.Name}." : $"Removed the look mapping for {target.Name}.");
     }
 
     private void RefreshMappingGrid()
     {
         _mappingGrid.Rows.Clear();
-        foreach (var mapping in _mappings)
-            _mappingGrid.Rows.Add(mapping.Source.OverriddenNpcName, mapping.Target.Name);
+        _mappingGridTargets = _mappings.Select(m => m.Target)
+            .Concat(_outfitAssignments.Select(m => m.Target))
+            .GroupBy(target => target.FormKeyText, StringComparer.OrdinalIgnoreCase)
+            .Select(group => group.First())
+            .ToArray();
+        foreach (var target in _mappingGridTargets)
+        {
+            var look = _mappings.FirstOrDefault(m => m.Target.FormKeyText.Equals(target.FormKeyText, StringComparison.OrdinalIgnoreCase));
+            var outfit = _outfitAssignments.FirstOrDefault(m => m.Target.FormKeyText.Equals(target.FormKeyText, StringComparison.OrdinalIgnoreCase));
+            _mappingGrid.Rows.Add(look?.Source.OverriddenNpcName ?? "(outfit only)", target.Name, outfit?.Outfit.Name ?? "");
+        }
+        UpdateOptionalOptions();
+    }
+
+    private void FilterOutfits()
+    {
+        var needle = _outfitSearch.Text.Trim();
+        var previous = (_outfitCatalog.SelectedItem as ModOutfit)?.FormKeyText;
+        _visibleOutfits = _allOutfits.Where(outfit => needle.Length == 0 ||
+            outfit.Name.Contains(needle, StringComparison.OrdinalIgnoreCase) ||
+            outfit.ModName.Contains(needle, StringComparison.OrdinalIgnoreCase) ||
+            outfit.Plugin.Contains(needle, StringComparison.OrdinalIgnoreCase) ||
+            outfit.FormKeyText.Contains(needle, StringComparison.OrdinalIgnoreCase))
+            .OrderBy(outfit => outfit.Name, StringComparer.OrdinalIgnoreCase)
+            .ThenBy(outfit => outfit.Plugin, StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+        _outfitCatalog.BeginUpdate();
+        _outfitCatalog.Items.Clear();
+        _outfitCatalog.Items.AddRange(_visibleOutfits.Cast<object>().ToArray());
+        if (previous is not null)
+            _outfitCatalog.SelectedIndex = Array.FindIndex(_visibleOutfits, outfit => outfit.FormKeyText.Equals(previous, StringComparison.OrdinalIgnoreCase));
+        _outfitCatalog.EndUpdate();
         UpdateOptionalOptions();
     }
 
     private void UpdateOptionalOptions()
     {
-        var canCopySkin = _mappings.Any(m => m.Source.HasCustomSkin);
-        var canCopyBody = _mappings.Any(m => m.Source.HasCustomBody);
-        var canCopyOutfit = _mappings.Any(m => m.Source.HasNewOutfit);
+        if (_updatingOptions) return;
+        _updatingOptions = true;
+        var mapping = SelectedMapping();
+        var source = mapping?.Source ?? SelectedSource();
+        var canCopySkin = _mappings.Any(m => m.Source.HasCustomSkin) || source?.HasCustomSkin == true;
+        var canCopyBody = _mappings.Any(m => m.Source.HasCustomBody) || source?.HasCustomBody == true;
+        var canReplaceOutfit = _mappings.Any(m => m.Source.HasNewOutfit) || source?.HasNewOutfit == true;
         _copySkin.Enabled = canCopySkin;
         _copyBody.Enabled = canCopyBody;
-        _copyOutfit.Enabled = canCopyOutfit;
+        _replaceOutfit.Enabled = canReplaceOutfit;
+        _outfitSearch.Enabled = _addOutfit.Checked;
+        _outfitCatalog.Enabled = _addOutfit.Checked;
         if (!canCopySkin) _copySkin.Checked = false;
         if (!canCopyBody) _copyBody.Checked = false;
-        if (!canCopyOutfit) _copyOutfit.Checked = false;
-        _optionsToolTip.SetToolTip(_copySkin, canCopySkin ? "Use the replacer's own body skin textures on the target." : "Enabled when the mod contains loose skin textures linked to this NPC.");
+        if (!canReplaceOutfit) _replaceOutfit.Checked = false;
+        _optionsToolTip.SetToolTip(_copySkin, canCopySkin ? "Use the replacer's own body skin textures on the target." : "Enabled when this NPC links to loose custom skin textures in the selected mod.");
         _optionsToolTip.SetToolTip(_skinOptionText, _optionsToolTip.GetToolTip(_copySkin));
-        _optionsToolTip.SetToolTip(_copyBody, canCopyBody ? "Use the replacer's own body mesh on the target." : "Enabled when the mod contains a loose, NPC-specific body mesh.");
+        _optionsToolTip.SetToolTip(_copyBody, canCopyBody ? "Use the replacer's own body mesh on the target." : "Enabled when this NPC links to a loose, NPC-specific body mesh in the selected mod.");
         _optionsToolTip.SetToolTip(_bodyOptionText, _optionsToolTip.GetToolTip(_copyBody));
-        _optionsToolTip.SetToolTip(_copyOutfit, canCopyOutfit ? "Use the replacer's new outfit on the target." : "Enabled when a replacer changes the source NPC's default outfit.");
-        _optionsToolTip.SetToolTip(_outfitOptionText, _optionsToolTip.GetToolTip(_copyOutfit));
+        _optionsToolTip.SetToolTip(_replaceOutfit, canReplaceOutfit ? "Use the new outfit assigned to the replacer NPC." : "Enabled when the replacer assigns this NPC a different default outfit.");
+        _optionsToolTip.SetToolTip(_replaceOutfitText, _optionsToolTip.GetToolTip(_replaceOutfit));
+        var outfitHelp = _allOutfits.Count == 0
+            ? "No Outfit records were found in enabled plugins."
+            : "Choose an Outfit record and tick this option, then click Add Mapping. A selected look is included too; use Clear look to make it outfit-only.";
+        _optionsToolTip.SetToolTip(_addOutfit, outfitHelp);
+        _optionsToolTip.SetToolTip(_addOutfitText, outfitHelp);
+        _addOutfitText.ForeColor = Color.White;
+        _updatingOptions = false;
     }
+
+    private MappingRow? SelectedMapping()
+    {
+        var target = SelectedMappingTarget();
+        return target is null ? null : _mappings.FirstOrDefault(m => m.Target.FormKeyText.Equals(target.FormKeyText, StringComparison.OrdinalIgnoreCase));
+    }
+
+    private TargetNpc? SelectedMappingTarget()
+    {
+        var index = _mappingGrid.CurrentRow?.Index ?? -1;
+        return index >= 0 && index < _mappingGridTargets.Length ? _mappingGridTargets[index] : null;
+    }
+
+    private NpcReplacement? SelectedSource() => _sourceClearedByUser ? null : _sourceGrid.CurrentRow?.Tag as NpcReplacement;
 
     private async Task CreateModAsync()
     {
         var mode = _outputMode.SelectedIndex switch
         {
             0 => AppearanceOutputMode.GalathilOutput,
-            2 => AppearanceOutputMode.SkyPatcher,
             _ => AppearanceOutputMode.EspfePatch
         };
-        if (_context is null || (_mappings.Count == 0 && mode != AppearanceOutputMode.GalathilOutput))
+        if (_context is null || (_mappings.Count == 0 && _outfitAssignments.Count == 0 && mode != AppearanceOutputMode.GalathilOutput))
         {
-            SetStatus("Add at least one mapping first.");
+            SetStatus("Add a look mapping or outfit assignment first.");
+            return;
+        }
+        if (mode == AppearanceOutputMode.EspfePatch && _outfitAssignments.Count > 0)
+        {
+            SetStatus("New outfit assignments require Galathil Output + SkyPatcher. Choose that output type first.");
             return;
         }
         var raceMismatches = _mappings.Where(m => !m.Source.RaceKey.Equals(m.Target.RaceKey, StringComparison.OrdinalIgnoreCase)).ToList();
         var genderMismatches = _mappings.Where(m => m.Source.IsFemale != m.Target.IsFemale).ToList();
         if (mode == AppearanceOutputMode.EspfePatch && genderMismatches.Count > 0)
         {
-            SetStatus("Different-sex appearance transfers require SkyPatcher. Choose Galathil Output + SkyPatcher or Same ESP + SkyPatcher.");
+            SetStatus("Different-sex appearance transfers require SkyPatcher. Choose Galathil Output + SkyPatcher.");
             return;
         }
         var changeTargetRace = mode != AppearanceOutputMode.EspfePatch;
@@ -589,12 +808,17 @@ internal sealed class MainForm : Form
         var context = _context;
         var copySkin = _copySkin.Checked;
         var copyBody = _copyBody.Checked;
-        var copyOutfit = _copyOutfit.Checked;
+        var replaceOutfit = _replaceOutfit.Checked;
         var assignments = _mappings.Select(m => new AppearanceAssignment(
             m.ModName, m.Plugin, m.Source.OverriddenNpcName, m.Source.OriginalFormKey, m.Target.Name, m.Target.FormKeyText,
             m.Source.HasCustomSkin, m.Source.HasCustomBody, m.Source.HasNewOutfit,
             m.Source.AppearancePlugin, m.Source.AppearanceFormKey, m.Source.RaceKey, m.Source.IsFemale,
-            m.Target.RaceKey, m.Target.IsFemale, m.Source.AppearanceMod)).ToList();
+            m.Target.RaceKey, m.Target.IsFemale, m.Source.AppearanceMod,
+            null, null, null)).ToList();
+        var outfitAssignments = _outfitAssignments.Select(row => new OutfitAssignment(
+            row.Target.Name, row.Target.FormKeyText,
+            row.Outfit.Name, row.Outfit.FormKeyText, row.Outfit.Plugin,
+            row.Outfit.WinningPlugin, row.Outfit.ModName)).ToList();
         SetBusy(true, mode == AppearanceOutputMode.GalathilOutput
             ? "Updating the shared Galathil Output mod and checking its files..."
             : "Replacing the source ESP and checking its files...");
@@ -611,16 +835,18 @@ internal sealed class MainForm : Form
                 context.PluginPaths,
                 context.Mods.Select(m => new GalathilModEntry(m.Name, m.Enabled)).ToList(),
                 assignments,
+                outfitAssignments,
                 mode,
                 copySkin,
                 copyBody,
-                copyOutfit,
+                replaceOutfit,
                 changeTargetRace));
             await RefreshProfileAsync();
             var completion = mode == AppearanceOutputMode.GalathilOutput
                 ? assignments.Count == 0
+                    && outfitAssignments.Count == 0
                     ? "Galathil Output was cleared. The output mod remains available for new mappings."
-                    : $"Updated Galathil Output with {assignments.Count} appearance mapping(s), {CountOutputPlugins(result.ModFolder)} ESPFE plugin(s), and one combined SkyPatcher config."
+                    : $"Updated Galathil Output with {assignments.Count} look mapping(s) and {outfitAssignments.Count} outfit assignment(s), {CountOutputPlugins(result.ModFolder)} ESPFE plugin(s), and one combined SkyPatcher config."
                 : $"Replaced {Path.GetFileName(result.PluginPath)} in {result.ModName} ({(result.SkyPatcherPath is null ? "one plugin" : "one plugin + SkyPatcher rule")}; no extra mod added).";
             SetBusy(false, completion);
             _statusText.ToolTipText = string.Join(Environment.NewLine, new[] { result.BackupPath, result.ModFolder }.Concat(result.Warnings));
@@ -688,34 +914,6 @@ internal sealed class MainForm : Form
         }
     }
 
-    private static void MakeResponsive(SplitContainer split, double initialRatio)
-    {
-        var ratio = initialRatio;
-        var applyingDistance = false;
-
-        void ApplyRatio()
-        {
-            var available = split.ClientSize.Width;
-            var minimum = split.Panel1MinSize;
-            var maximum = available - split.Panel2MinSize - split.SplitterWidth;
-            if (maximum < minimum) return;
-            var distance = Math.Clamp((int)Math.Round(available * ratio), minimum, maximum);
-            if (split.SplitterDistance == distance) return;
-            applyingDistance = true;
-            try { split.SplitterDistance = distance; }
-            catch (InvalidOperationException) { }
-            finally { applyingDistance = false; }
-        }
-
-        split.SizeChanged += (_, _) => ApplyRatio();
-        split.SplitterMoved += (_, _) =>
-        {
-            if (applyingDistance || split.ClientSize.Width <= 0) return;
-            ratio = Math.Clamp((double)split.SplitterDistance / split.ClientSize.Width, 0.15, 0.85);
-        };
-        split.HandleCreated += (_, _) => split.BeginInvoke((Action)ApplyRatio);
-    }
-
     private sealed class BufferedDataGridView : DataGridView
     {
         public BufferedDataGridView() => DoubleBuffered = true;
@@ -737,6 +935,7 @@ internal sealed class MainForm : Form
         string? AppearancePlugin = null, string? AppearanceFormKey = null, string? ExistingTargetFormKey = null, string? ExistingRouteProblem = null, string? AppearanceMod = null);
     private sealed record TargetNpc(string Name, string EditorId, string FormKeyText, string WinningPlugin, string RaceKey, bool IsFemale);
     private sealed record MappingRow(string ModName, string Plugin, NpcReplacement Source, TargetNpc Target);
+    private sealed record OutfitAssignmentRow(TargetNpc Target, ModOutfit Outfit);
 
     private static string SavedAssignmentKey(string modName, string pluginName, string formKey) =>
         modName + "|" + pluginName + "|" + formKey;
@@ -783,6 +982,9 @@ internal sealed class MainForm : Form
                 AddPluginFiles(Path.Combine(modsPath, mod.Name), pluginPaths);
             AddPluginFiles(Path.Combine(instance, "overwrite"), pluginPaths);
             var implicitMasters = new[] { "Skyrim.esm", "Update.esm", "Dawnguard.esm", "HearthFires.esm", "Dragonborn.esm", "_ResourcePack.esl" };
+            // MO2 may omit the game's always-loaded masters from plugins.txt. Keep
+            // them active for master checks when their files are present.
+            active.UnionWith(implicitMasters.Where(pluginPaths.ContainsKey));
             var loadOrder = implicitMasters.Where(pluginPaths.ContainsKey).ToList();
             foreach (var plugin in File.ReadLines(Path.Combine(profilePath, "loadorder.txt")).Select(l => l.Trim()))
                 if (plugin.Length > 0 && !plugin.StartsWith('#') && active.Contains(plugin) && !loadOrder.Contains(plugin, StringComparer.OrdinalIgnoreCase)) loadOrder.Add(plugin);
@@ -808,6 +1010,7 @@ internal sealed class MainForm : Form
         public static NpcScanResult ReadActiveNpcIndex(ProfileContext context)
         {
             var indexed = new Dictionary<string, TargetNpc>(StringComparer.OrdinalIgnoreCase);
+            var outfits = new Dictionary<string, ModOutfit>(StringComparer.OrdinalIgnoreCase);
             var errors = new List<string>();
             foreach (var plugin in context.ActivePluginOrder)
             {
@@ -819,12 +1022,26 @@ internal sealed class MainForm : Form
                 try
                 {
                     using var mod = SkyrimMod.CreateFromBinaryOverlay(path, SkyrimRelease.SkyrimSE);
+                    var modName = FindMo2ModName(context, path);
                     foreach (var npc in mod.Npcs)
                     {
                         if (npc.IsDeleted) { indexed.Remove(FormKeyText(npc.FormKey)); continue; }
                         var key = FormKeyText(npc.FormKey);
                         indexed[key] = new TargetNpc(DisplayName(npc.Name?.String, npc.EditorID, key), npc.EditorID ?? "", key, plugin,
                             FormKeyText(npc.Race.FormKey), IsFemale(npc));
+                    }
+                    foreach (var outfit in mod.Outfits)
+                    {
+                        var key = FormKeyText(outfit.FormKey);
+                        if (outfit.IsDeleted || !HasOutfitItems(outfit))
+                        {
+                            outfits.Remove(key);
+                            continue;
+                        }
+                        var ownerPlugin = outfit.FormKey.ModKey.FileName.ToString();
+                        outfits[key] = new ModOutfit(
+                            string.IsNullOrWhiteSpace(outfit.EditorID) ? key : outfit.EditorID!,
+                            key, ownerPlugin, plugin, modName);
                     }
                 }
                 catch (Exception ex)
@@ -833,7 +1050,19 @@ internal sealed class MainForm : Form
                     Debug.WriteLine($"NPC scan skipped {plugin}: {ex.Message}");
                 }
             }
-            return new NpcScanResult(indexed.Values.OrderBy(n => n.Name, StringComparer.OrdinalIgnoreCase).ToList(), errors);
+            return new NpcScanResult(indexed.Values.OrderBy(n => n.Name, StringComparer.OrdinalIgnoreCase).ToList(),
+                outfits.Values.OrderBy(o => o.Name, StringComparer.OrdinalIgnoreCase).ToList(), errors);
+        }
+
+        private static string FindMo2ModName(ProfileContext context, string pluginPath)
+        {
+            var fullPath = Path.GetFullPath(pluginPath);
+            foreach (var mod in context.Mods.Where(m => m.Enabled && !m.IsSeparator))
+            {
+                var root = Path.GetFullPath(Path.Combine(context.ModsPath, mod.Name)).TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
+                if (fullPath.StartsWith(root, StringComparison.OrdinalIgnoreCase)) return mod.Name;
+            }
+            return "Game Data";
         }
 
         public static List<NpcReplacement> ReadNpcOverrides(string path, string pluginName, ProfileContext context, IReadOnlyList<TargetNpc> activeTargets)
@@ -870,15 +1099,23 @@ internal sealed class MainForm : Form
                 return linkedMod is null || linkedMod == mod ? null : selector(linkedMod);
             }
 
-            string? LooseAssetPath(string? relativePath)
+            string? LooseAssetPath(string? relativePath, string? assetFolder = null)
             {
                 if (string.IsNullOrWhiteSpace(relativePath)) return null;
                 try
                 {
                     var normalized = relativePath.Replace('/', Path.DirectorySeparatorChar).Replace('\\', Path.DirectorySeparatorChar);
-                    var fullPath = Path.GetFullPath(Path.Combine(sourceModFolder, normalized));
                     var root = Path.GetFullPath(sourceModFolder).TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
-                    return fullPath.StartsWith(root, StringComparison.OrdinalIgnoreCase) && File.Exists(fullPath) ? fullPath : null;
+                    var candidates = new List<string> { normalized };
+                    if (!string.IsNullOrWhiteSpace(assetFolder) &&
+                        !normalized.StartsWith(assetFolder + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase))
+                        candidates.Insert(0, Path.Combine(assetFolder, normalized));
+                    foreach (var candidate in candidates)
+                    {
+                        var fullPath = Path.GetFullPath(Path.Combine(sourceModFolder, candidate));
+                        if (fullPath.StartsWith(root, StringComparison.OrdinalIgnoreCase) && File.Exists(fullPath)) return fullPath;
+                    }
+                    return null;
                 }
                 catch (Exception ex) when (ex is ArgumentException or IOException or NotSupportedException)
                 {
@@ -888,16 +1125,22 @@ internal sealed class MainForm : Form
 
             bool HasUniqueBodyModel(string? relativePath)
             {
-                if (LooseAssetPath(relativePath) is null) return false;
+                if (LooseAssetPath(relativePath, "meshes") is null) return false;
                 var normalized = relativePath!.Replace('/', '\\').TrimStart('\\');
-                if (!normalized.StartsWith("meshes\\actors\\character\\", StringComparison.OrdinalIgnoreCase)) return false;
+                if (!normalized.StartsWith("meshes\\", StringComparison.OrdinalIgnoreCase)) normalized = "meshes\\" + normalized;
+                var characterModel = normalized.StartsWith("meshes\\actors\\character\\", StringComparison.OrdinalIgnoreCase);
+                var fileName = Path.GetFileNameWithoutExtension(normalized);
+                var bodyPartModel = fileName.Contains("body", StringComparison.OrdinalIgnoreCase) ||
+                    fileName.Contains("hands", StringComparison.OrdinalIgnoreCase) ||
+                    fileName.Contains("feet", StringComparison.OrdinalIgnoreCase);
+                if (!characterModel && !bodyPartModel) return false;
                 var sharedBodyFiles = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
                 {
                     "femalebody_0.nif", "femalebody_1.nif", "femalehands_0.nif", "femalehands_1.nif",
                     "femalefeet_0.nif", "femalefeet_1.nif", "malebody_0.nif", "malebody_1.nif",
                     "malehands_0.nif", "malehands_1.nif", "malefeet_0.nif", "malefeet_1.nif"
                 };
-                if (!sharedBodyFiles.Contains(Path.GetFileName(normalized))) return true;
+                if (!characterModel || !sharedBodyFiles.Contains(Path.GetFileName(normalized))) return true;
                 var parts = normalized.Split('\\', StringSplitOptions.RemoveEmptyEntries);
                 var commonBodyFolder = Array.FindLastIndex(parts, p => p.Equals("character assets", StringComparison.OrdinalIgnoreCase));
                 if (commonBodyFolder < 0) return true;
@@ -931,8 +1174,9 @@ internal sealed class MainForm : Form
                 return texturePaths.Any(assetPath =>
                 {
                     if (string.IsNullOrWhiteSpace(assetPath)) return false;
-                    if (LooseAssetPath(assetPath) is null) return false;
+                    if (LooseAssetPath(assetPath, "textures") is null) return false;
                     var normalized = assetPath.Replace('/', '\\').TrimStart('\\');
+                    if (!normalized.StartsWith("textures\\", StringComparison.OrdinalIgnoreCase)) normalized = "textures\\" + normalized;
                     if (normalized.Contains("\\facegendata\\", StringComparison.OrdinalIgnoreCase)) return false;
                     if (!sharedCharacterTextures.Contains(Path.GetFileName(normalized))) return true;
                     var parts = normalized.Split('\\', StringSplitOptions.RemoveEmptyEntries);
@@ -1083,12 +1327,20 @@ internal sealed class MainForm : Form
         }
 
         private static string FormKeyText(FormKey key) => $"{key.ModKey.FileName}|{key.ID:X}";
+        private static bool HasOutfitItems(object outfit)
+        {
+            var items = outfit.GetType().GetProperty("Items")?.GetValue(outfit);
+            if (items is not System.Collections.IEnumerable entries) return false;
+            var iterator = entries.GetEnumerator();
+            try { return iterator.MoveNext(); }
+            finally { (iterator as IDisposable)?.Dispose(); }
+        }
         private static bool IsFemale(INpcGetter npc) => npc.Configuration.Flags.ToString().Split(',')
             .Any(flag => flag.Trim().Equals("Female", StringComparison.OrdinalIgnoreCase));
         private static string DisplayName(string? name, string? editorId, string formKey) =>
             !string.IsNullOrWhiteSpace(name) ? name : !string.IsNullOrWhiteSpace(editorId) ? editorId! : formKey;
 
-        public sealed record NpcScanResult(List<TargetNpc> Npcs, List<string> Errors);
+        public sealed record NpcScanResult(List<TargetNpc> Npcs, List<ModOutfit> Outfits, List<string> Errors);
     }
 
     private static class Mo2Paths
