@@ -16,7 +16,7 @@ Each linked replacer mod stays enabled so the game can use its face and body ass
 
 In **Galathil Output**, `Galathil Asset Mods.txt` lists all linked asset mods. Each source ESP also gets a separate note named `Asset Mod - <source ESP> - <asset mod>.txt`. The asset mod contains a matching `Galathil Link - <source ESP>.txt` note.
 
-Skyrim SE 1.6.1130 and later support light-plugin local FormIDs through `0xFFF`; Galathil allocates IDs `0x001` through `0xFFF` and creates additional ESPFE plugins if the output needs more NPC records. Earlier runtimes may require Backported Extended ESL Support for plugins using IDs below `0x800`.
+Skyrim SE 1.6.1130 and later support light-plugin local FormIDs through `0xFFF`; Galathil allocates IDs `0x001` through `0xFFF` and creates additional ESPFE plugins if the output needs more NPC records. Earlier runtimes may require Backported Extended ESL Support for plugins using IDs below `0x800`. In the event that it doesn't work, the non-SkyPatcher option should still work and generate an ESPFE.
 
 ## Other output choices
 
