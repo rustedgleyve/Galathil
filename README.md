@@ -34,7 +34,7 @@ Skyrim SE 1.6.1130 and later support light-plugin local FormIDs through `0xFFF`;
 
 **Same ESP + SkyPatcher** adds an appearance record and SkyPatcher rule to the source mod.
 
-Galathil asks before a SkyPatcher transfer changes an NPC's race or sex. These changes can affect voice compatibility, animations, and race-based behavior. The direct ESP option blocks a different-sex transfer.
+Galathil asks before a SkyPatcher transfer changes an NPC's race or sex. These changes can affect voice compatibility, animations, and race-based behavior, and likely need other mods to supplement those (Ralof or Cicero Genderswap Mods for example) The direct ESP option blocks a different-sex transfer (temporarily).
 
 ## Run from Mod Organizer 2
 
