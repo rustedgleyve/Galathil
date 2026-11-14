@@ -2,9 +2,11 @@
 
 ## Simple NPC Replacer Swapper
 
-Simple NPC Replacer swapper that creates a shared Galathil Output mod with ESPFE plugin(s) and one combined SkyPatcher setup. It can also replace the source ESP directly. Designed to be simpler than its alternatives.
+Simple NPC Replacer swapper that creates a shared Galathil Output mod with ESPFE plugin(s) and one combined SkyPatcher setup. It can also replace the source ESP directly. Designed to be simpler than its alternatives (atleast, according to me, who only ever did it manually through SSEedit)
 
 Optional features include bringing over custom skin textures, custom bodies, and new outfits when they are detected.
+
+Currently, it was designed around single replacers, not AiO replacers. Could work, but I wouldn't know until I get to doing that.
 
 ## Requirements
 
