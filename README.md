@@ -2,15 +2,22 @@
 
 ## Simple NPC Replacer Swapper
 
-Tested only on Skyrim SE 1.6.1170.
-
 Simple NPC Replacer swapper that creates a shared Galathil Output mod with ESPFE plugin(s) and one combined SkyPatcher setup. It can also replace the source ESP directly. Designed to be simpler than its alternatives.
 
 Optional features include bringing over custom skin textures, custom bodies, and new outfits when they are detected.
 
-## Shared Galathil Output
+## Requirements
+
+- Windows x64
+- Skyrim SE 1.6.1170 (the only runtime tested. Theoretically nothing stops it from testing on newer versions, and older versions with BEEs. Just haven't tested it)
+- Mod Organizer 2 with the intended profile selected
+- .NET 10 Desktop Runtime
+- SkyPatcher enabled for SkyPatcher output
+
+## Output Settings
 
 Choose **Galathil Output + SkyPatcher** to add or update NPC appearance mappings in one MO2 mod. Galathil creates the output ESPFE plugin(s), a combined SkyPatcher config, and notes that identify the asset mods used by each source ESP.
+The other option is to directly replace the existing ESP of the replacer.
 
 Each linked replacer mod stays enabled so the game can use its face and body assets. Galathil disables that mod's source ESP in the selected profile when no active plugin depends on it, the output does not need it as a master, and any older Galathil routes have been migrated. The source ESP file stays inside the asset mod so Galathil can read the replacer and recover its appearance later. If another plugin, output record, or unmigrated route needs the source ESP, Galathil leaves it enabled and explains why.
 
@@ -25,14 +32,6 @@ Skyrim SE 1.6.1130 and later support light-plugin local FormIDs through `0xFFF`;
 **Same ESP + SkyPatcher** adds an appearance record and SkyPatcher rule to the source mod.
 
 Galathil asks before a SkyPatcher transfer changes an NPC's race or sex. These changes can affect voice compatibility, animations, and race-based behavior. The direct ESP option blocks a different-sex transfer.
-
-## Requirements
-
-- Windows x64
-- Skyrim SE 1.6.1170 (the only runtime tested. Theoretically nothing stops it from testing on newer versions, and older versions with BEEs. Just haven't tested it)
-- Mod Organizer 2 with the intended profile selected
-- .NET 10 Desktop Runtime
-- SkyPatcher enabled for SkyPatcher output
 
 ## Run from Mod Organizer 2
 
