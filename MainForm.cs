@@ -191,7 +191,7 @@ internal sealed class MainForm : Form
         outputType.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 82));
         outputType.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
         outputType.Controls.Add(new Label { Text = "Output type", Dock = DockStyle.Fill, TextAlign = ContentAlignment.MiddleLeft, ForeColor = Color.White }, 0, 0);
-        _outputMode.Items.AddRange(["Galathil Output + SkyPatcher", "Replace source ESP"]);
+        _outputMode.Items.AddRange(["Galathil Output ESP", "Replace source ESP"]);
         _outputMode.SelectedIndex = 0;
         outputType.Controls.Add(_outputMode, 1, 0);
         optionsGrid.Controls.Add(outputType, 0, 0);
@@ -336,7 +336,7 @@ internal sealed class MainForm : Form
             _sourceGrid.Rows.Clear();
             _plugins.Items.Clear();
             var warning = scan.Errors.Count == 0 ? "" : $" {scan.Errors.Count} plugins could not be scanned; see details in the status tooltip.";
-            SetBusy(false, $"Loaded profile '{profileName}': {_allMods.Count(m => !m.IsSeparator)} mods, {_allTargets.Count:N0} unique active NPCs, {context.ActivePlugins.Count} active plugins.{warning}");
+            SetBusy(false, $"Loaded profile '{profileName}': {_allMods.Count(m => !m.IsSeparator)} mods, {_allTargets.Count:N0} unique active NPCs, {context.ActivePlugins.Count} active plugins.{warning}{(string.IsNullOrWhiteSpace(planIssue) ? "" : $" {planIssue}")}");
             var details = scan.Errors.Take(30).ToList();
             if (!string.IsNullOrWhiteSpace(planIssue)) details.Insert(0, planIssue);
             _statusText.ToolTipText = details.Count == 0 ? "" : string.Join(Environment.NewLine, details);
@@ -374,12 +374,18 @@ internal sealed class MainForm : Form
         {
             var manifest = System.Text.Json.JsonSerializer.Deserialize<GalathilOutputManifest>(File.ReadAllText(path));
             if (manifest is null || manifest.Version != 1) return "Galathil Output has an unsupported or empty saved plan.";
+            var missingMods = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             _copySkin.Checked = manifest.CopySkin;
             _copyBody.Checked = manifest.CopyBody;
             _replaceOutfit.Checked = manifest.CopyOutfit;
             if (manifest.OutfitAssignments is not null)
                 foreach (var assignment in manifest.OutfitAssignments)
                 {
+                    if (!HasSavedOutfitSource(context, assignment))
+                    {
+                        missingMods.Add(assignment.OutfitModName);
+                        continue;
+                    }
                     var outfit = _allOutfits.FirstOrDefault(o => o.FormKeyText.Equals(assignment.OutfitFormKey, StringComparison.OrdinalIgnoreCase))
                         ?? new ModOutfit(assignment.OutfitName, assignment.OutfitFormKey, assignment.OutfitPlugin,
                             assignment.OutfitPlugin, assignment.OutfitModName);
@@ -390,9 +396,19 @@ internal sealed class MainForm : Form
                 }
             foreach (var assignment in manifest.Assignments)
             {
-                _savedOutputAssignmentsBySource[SavedAssignmentKey(assignment.SourceMod, assignment.SourcePlugin, assignment.SourceFormKey)] = assignment;
+                var sourceModName = ResolveSavedSourceMod(context, assignment.SourceMod, assignment.SourcePlugin, assignment.SourceFormKey);
+                if (!HasSavedModPlugin(context.ModsPath, sourceModName, assignment.SourcePlugin))
+                {
+                    missingMods.Add(sourceModName);
+                    continue;
+                }
+                var resolvedAssignment = assignment with { SourceMod = sourceModName };
+                _savedOutputAssignmentsBySource[SavedAssignmentKey(sourceModName, assignment.SourcePlugin, assignment.SourceFormKey)] = resolvedAssignment;
+                var keySeparator = assignment.SourceFormKey.LastIndexOf('|');
+                var sourcePluginFromKey = keySeparator > 0 ? assignment.SourceFormKey[..keySeparator] : "";
+                var isDirectOverride = !sourcePluginFromKey.Equals(assignment.SourcePlugin, StringComparison.OrdinalIgnoreCase);
                 var source = new NpcReplacement(assignment.SourceName, "", assignment.SourceFormKey, assignment.SourceName,
-                    true, assignment.SourceRaceKey ?? "", assignment.SourceIsFemale, assignment.HasCustomSkin,
+                    isDirectOverride, assignment.SourceRaceKey ?? "", assignment.SourceIsFemale, assignment.HasCustomSkin,
                     assignment.HasCustomBody, assignment.HasNewOutfit, assignment.AppearancePlugin, assignment.AppearanceFormKey,
                     null, null, assignment.AppearanceMod);
                 var target = _allTargets.FirstOrDefault(n => n.FormKeyText.Equals(assignment.TargetFormKey, StringComparison.OrdinalIgnoreCase));
@@ -412,14 +428,72 @@ internal sealed class MainForm : Form
                             assignment.ProvidedOutfitPlugin ?? assignment.SourcePlugin, assignment.SourceMod);
                     _outfitAssignments.Add(new OutfitAssignmentRow(target with { Name = assignment.TargetName }, oldOutfit));
                 }
-                _mappings.Add(new MappingRow(assignment.SourceMod, assignment.SourcePlugin, source,
+                _mappings.Add(new MappingRow(sourceModName, assignment.SourcePlugin, source,
                     target with { Name = assignment.TargetName }));
             }
-            return null;
+            return missingMods.Count == 0
+                ? null
+                : $"Found saved entries from missing mod(s): {string.Join(", ", missingMods.OrderBy(name => name, StringComparer.OrdinalIgnoreCase))}. Click Apply Look to remove them from Galathil Output.";
         }
         catch (Exception ex)
         {
             return $"Could not load Galathil Output plan: {ex.Message}";
+        }
+    }
+
+    private static bool HasSavedModPlugin(string modsPath, string modName, string pluginName)
+    {
+        if (string.IsNullOrWhiteSpace(modName) || modName.Equals("Game Data", StringComparison.OrdinalIgnoreCase)) return false;
+        var folder = Path.GetFullPath(Path.Combine(modsPath, modName));
+        var modsRoot = Path.GetFullPath(modsPath).TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
+        return folder.StartsWith(modsRoot, StringComparison.OrdinalIgnoreCase) && Directory.Exists(folder) &&
+            PluginFileAccess.FindInModFolder(folder, pluginName) is not null;
+    }
+
+    private static bool HasSavedOutfitSource(ProfileContext context, OutfitAssignment assignment)
+    {
+        if (assignment.OutfitModName.Equals("Game Data", StringComparison.OrdinalIgnoreCase))
+            return context.PluginPaths.ContainsKey(assignment.OutfitPlugin) && context.PluginPaths.ContainsKey(assignment.OutfitWinningPlugin);
+        return HasSavedModPlugin(context.ModsPath, assignment.OutfitModName, assignment.OutfitWinningPlugin) ||
+            HasSavedModPlugin(context.ModsPath, assignment.OutfitModName, assignment.OutfitPlugin);
+    }
+
+    private static string ResolveSavedSourceMod(ProfileContext context, string savedModName, string pluginName, string sourceFormKey)
+    {
+        var candidates = context.Mods.Where(mod => !mod.IsSeparator)
+            .Select(mod => (mod.Name, Path: PluginFileAccess.FindInModFolder(Path.Combine(context.ModsPath, mod.Name), pluginName)))
+            .Where(candidate => candidate.Path is not null)
+            .ToArray();
+
+        var savedMatch = candidates.FirstOrDefault(candidate => candidate.Name.Equals(savedModName, StringComparison.OrdinalIgnoreCase));
+        if (savedMatch.Path is not null) return savedMatch.Name;
+        if (candidates.Length == 0) return savedModName;
+
+        if (context.ActivePlugins.Contains(pluginName) && context.PluginPaths.TryGetValue(pluginName, out var activePath))
+        {
+            var activeMatch = candidates.FirstOrDefault(candidate => Path.GetFullPath(candidate.Path!)
+                .Equals(Path.GetFullPath(activePath), StringComparison.OrdinalIgnoreCase));
+            if (activeMatch.Path is not null) return activeMatch.Name;
+        }
+
+        var matchingRecordCandidates = candidates.Where(candidate => PluginContainsNpc(candidate.Path!, pluginName, sourceFormKey)).ToArray();
+        if (matchingRecordCandidates.Length == 1) return matchingRecordCandidates[0].Name;
+        if (candidates.Length == 1) return candidates[0].Name;
+        return savedModName;
+    }
+
+    private static bool PluginContainsNpc(string path, string pluginName, string sourceFormKey)
+    {
+        try
+        {
+            using var lease = PluginFileAccess.Open(pluginName, path);
+            return lease.Mod.Npcs.Any(npc =>
+                $"{npc.FormKey.ModKey.FileName}|{npc.FormKey.ID:X}".Equals(sourceFormKey, StringComparison.OrdinalIgnoreCase));
+        }
+        catch (Exception ex)
+        {
+            Debug.WriteLine($"Could not check {pluginName} for saved NPC {sourceFormKey}: {ex.Message}");
+            return false;
         }
     }
 
@@ -448,15 +522,20 @@ internal sealed class MainForm : Form
         _sourceGrid.Rows.Clear();
         var modPath = Path.Combine(_context.ModsPath, mod.Name);
         if (!Directory.Exists(modPath)) { SetStatus($"MO2 mod folder not found: {mod.Name}"); return; }
-        foreach (var file in Directory.GetFiles(modPath, "*.*", SearchOption.TopDirectoryOnly)
-                     .Where(IsPluginFile).OrderBy(Path.GetFileName, StringComparer.OrdinalIgnoreCase))
+        var pluginFiles = new List<(string Name, string Path, bool Hidden)>();
+        foreach (var file in Directory.GetFiles(modPath, "*.*", SearchOption.TopDirectoryOnly))
         {
-            var name = Path.GetFileName(file);
-            var isActive = _context.ActivePlugins.Contains(name);
-            _plugins.Items.Add(new PluginChoice(name, file, isActive));
+            if (PluginFileAccess.TryGetPluginName(file, out var name))
+                pluginFiles.Add((name, file, PluginFileAccess.IsHiddenFile(file)));
         }
+        var visibleNames = pluginFiles.Where(file => !file.Hidden).Select(file => file.Name)
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        foreach (var file in pluginFiles.Where(file => !file.Hidden || !visibleNames.Contains(file.Name))
+                     .OrderBy(file => file.Name, StringComparer.OrdinalIgnoreCase))
+            _plugins.Items.Add(new PluginChoice(file.Name, file.Path,
+                !file.Hidden && _context.ActivePlugins.Contains(file.Name), file.Hidden));
         if (_plugins.Items.Count > 0) _plugins.SelectedIndex = 0;
-        else SetStatus($"'{mod.Name}' has no root-level ESP/ESM/ESL plugins.");
+        else SetStatus($"'{mod.Name}' has no root-level ESP/ESM/ESL plugins, including MO2-hidden plugins.");
     }
 
     private async Task LoadSourcePluginAsync()
@@ -553,14 +632,10 @@ internal sealed class MainForm : Form
             SetStatus("Select a look source, or tick Add Outfit to create an outfit-only mapping.");
             return;
         }
-        if (source is not null && !source.IsDirectOverride)
-        {
-            SetStatus("That character was added by the mod, rather than replacing an existing one. Choose an override record or clear the look selection to add an outfit only.");
-            return;
-        }
+        if (source?.IsAddedNpc == true && _outputMode.SelectedIndex != 0) _outputMode.SelectedIndex = 0;
         if (addOutfit && _outputMode.SelectedIndex != 0)
         {
-            SetStatus("Adding an outfit requires Galathil Output + SkyPatcher. Choose that output type first.");
+            SetStatus("Adding an outfit requires Galathil Output ESP. Choose that output type first.");
             return;
         }
 
@@ -569,7 +644,7 @@ internal sealed class MainForm : Form
         {
             target = _visibleTargets[_targetList.SelectedIndices[0]];
         }
-        else if (source is not null)
+        else if (source is { IsDirectOverride: true })
         {
             _outputMode.SelectedIndex = 0;
             if (!string.IsNullOrWhiteSpace(source.ExistingRouteProblem))
@@ -586,6 +661,18 @@ internal sealed class MainForm : Form
             }
             target = defaultTarget;
         }
+        else if (source?.IsAddedNpc == true)
+        {
+            var savedTarget = string.IsNullOrWhiteSpace(source.ExistingTargetFormKey)
+                ? null
+                : _allTargets.FirstOrDefault(n => n.FormKeyText.Equals(source.ExistingTargetFormKey, StringComparison.OrdinalIgnoreCase));
+            if (savedTarget is null)
+            {
+                SetStatus("Choose an existing NPC to receive this follower's appearance.");
+                return;
+            }
+            target = savedTarget;
+        }
         else
         {
             SetStatus("Select the character who should receive this outfit.");
@@ -599,7 +686,12 @@ internal sealed class MainForm : Form
             return;
         }
 
-        if (source is not null && source.OriginalFormKey.Equals(target.FormKeyText, StringComparison.OrdinalIgnoreCase) && _outputMode.SelectedIndex != 0)
+        if (source?.IsAddedNpc == true && source.OriginalFormKey.Equals(target.FormKeyText, StringComparison.OrdinalIgnoreCase))
+        {
+            SetStatus("The selected follower is the appearance donor. Choose a different NPC as the recipient.");
+            return;
+        }
+        if (source is not null && source.IsDirectOverride && source.OriginalFormKey.Equals(target.FormKeyText, StringComparison.OrdinalIgnoreCase) && _outputMode.SelectedIndex != 0)
         {
             SetStatus("The target is the NPC this replacer already overrides. Choose a different target to redirect it.");
             return;
@@ -659,13 +751,13 @@ internal sealed class MainForm : Form
         var displayIndex = Array.FindIndex(_mappingGridTargets, row => row.FormKeyText.Equals(target.FormKeyText, StringComparison.OrdinalIgnoreCase));
         if (displayIndex >= 0) _mappingGrid.CurrentCell = _mappingGrid.Rows[displayIndex].Cells[0];
         if (addedLook && addedOutfit)
-            SetStatus($"Added {source!.OverriddenNpcName} and {outfit!.Name} → {target.Name}. Click Apply Look to update Galathil Output.");
+            SetStatus($"Added {source!.TransferName} and {outfit!.Name} → {target.Name}. Click Apply Look to update Galathil Output.");
         else if (addedOutfit && existingLook is not null)
             SetStatus($"Added {outfit!.Name} to {target.Name}'s mapping. Click Apply Look to update Galathil Output.");
         else if (addedOutfit)
             SetStatus($"Added outfit-only mapping: {outfit!.Name} → {target.Name}. Click Apply Look to update Galathil Output.");
         else
-            SetStatus($"Added {source!.OverriddenNpcName} → {target.Name}. Click Apply Look to update Galathil Output.");
+            SetStatus($"Added {source!.TransferName} → {target.Name}. Click Apply Look to update Galathil Output.");
     }
 
     private void RemoveMapping()
@@ -697,7 +789,7 @@ internal sealed class MainForm : Form
         {
             var look = _mappings.FirstOrDefault(m => m.Target.FormKeyText.Equals(target.FormKeyText, StringComparison.OrdinalIgnoreCase));
             var outfit = _outfitAssignments.FirstOrDefault(m => m.Target.FormKeyText.Equals(target.FormKeyText, StringComparison.OrdinalIgnoreCase));
-            _mappingGrid.Rows.Add(look?.Source.OverriddenNpcName ?? "(outfit only)", target.Name, outfit?.Outfit.Name ?? "");
+            _mappingGrid.Rows.Add(look?.Source.TransferName ?? "(outfit only)", target.Name, outfit?.Outfit.Name ?? "");
         }
         UpdateOptionalOptions();
     }
@@ -729,6 +821,12 @@ internal sealed class MainForm : Form
         _updatingOptions = true;
         var mapping = SelectedMapping();
         var source = mapping?.Source ?? SelectedSource();
+        var addedNpcDonorSelected = _mappings.Any(m => m.Source.IsAddedNpc) || source?.IsAddedNpc == true;
+        if (addedNpcDonorSelected && _outputMode.SelectedIndex != 0) _outputMode.SelectedIndex = 0;
+        _outputMode.Enabled = !addedNpcDonorSelected;
+        _optionsToolTip.SetToolTip(_outputMode, addedNpcDonorSelected
+            ? "Added follower NPCs are appearance donors. Galathil Output ESP copies their appearance into recipient overrides, then disables the follower ESP in this profile."
+            : "Choose the shared output ESP or replace the source ESP.");
         var canCopySkin = _mappings.Any(m => m.Source.HasCustomSkin) || source?.HasCustomSkin == true;
         var canCopyBody = _mappings.Any(m => m.Source.HasCustomBody) || source?.HasCustomBody == true;
         var canReplaceOutfit = _mappings.Any(m => m.Source.HasNewOutfit) || source?.HasNewOutfit == true;
@@ -744,7 +842,7 @@ internal sealed class MainForm : Form
         _optionsToolTip.SetToolTip(_skinOptionText, _optionsToolTip.GetToolTip(_copySkin));
         _optionsToolTip.SetToolTip(_copyBody, canCopyBody ? "Use the replacer's own body mesh on the target." : "Enabled when this NPC links to a loose, NPC-specific body mesh in the selected mod.");
         _optionsToolTip.SetToolTip(_bodyOptionText, _optionsToolTip.GetToolTip(_copyBody));
-        _optionsToolTip.SetToolTip(_replaceOutfit, canReplaceOutfit ? "Use the new outfit assigned to the replacer NPC." : "Enabled when the replacer assigns this NPC a different default outfit.");
+        _optionsToolTip.SetToolTip(_replaceOutfit, canReplaceOutfit ? "Use the donor NPC's outfit on the recipient." : "Enabled when the donor NPC has a new or assigned default outfit.");
         _optionsToolTip.SetToolTip(_replaceOutfitText, _optionsToolTip.GetToolTip(_replaceOutfit));
         var outfitHelp = _allOutfits.Count == 0
             ? "No Outfit records were found in enabled plugins."
@@ -781,16 +879,21 @@ internal sealed class MainForm : Form
             SetStatus("Add a look mapping or outfit assignment first.");
             return;
         }
+        if (mode != AppearanceOutputMode.GalathilOutput && _mappings.Any(m => m.Source.IsAddedNpc))
+        {
+            SetStatus("Added follower NPCs can only supply a look through Galathil Output ESP.");
+            return;
+        }
         if (mode == AppearanceOutputMode.EspfePatch && _outfitAssignments.Count > 0)
         {
-            SetStatus("New outfit assignments require Galathil Output + SkyPatcher. Choose that output type first.");
+            SetStatus("New outfit assignments require Galathil Output ESP. Choose that output type first.");
             return;
         }
         var raceMismatches = _mappings.Where(m => !m.Source.RaceKey.Equals(m.Target.RaceKey, StringComparison.OrdinalIgnoreCase)).ToList();
         var genderMismatches = _mappings.Where(m => m.Source.IsFemale != m.Target.IsFemale).ToList();
         if (mode == AppearanceOutputMode.EspfePatch && genderMismatches.Count > 0)
         {
-            SetStatus("Different-sex appearance transfers require SkyPatcher. Choose Galathil Output + SkyPatcher.");
+            SetStatus("Different-sex appearance transfers require Galathil Output ESP.");
             return;
         }
         var changeTargetRace = mode != AppearanceOutputMode.EspfePatch;
@@ -800,8 +903,8 @@ internal sealed class MainForm : Form
                 !m.Source.RaceKey.Equals(m.Target.RaceKey, StringComparison.OrdinalIgnoreCase) || m.Source.IsFemale != m.Target.IsFemale)
                 .Take(5).Select(m => $"{m.Source.OverriddenNpcName} → {m.Target.Name}"));
             var choice = MessageBox.Show(this,
-                $"SkyPatcher applies the source character's race and sex along with the appearance.{Environment.NewLine}{examples}{Environment.NewLine}{Environment.NewLine}This can affect race behavior, voice compatibility, and animations. Continue?",
-                "SkyPatcher changes race and sex", MessageBoxButtons.YesNo, MessageBoxIcon.Warning);
+                $"Galathil will set the recipient's race and sex to match the source.{Environment.NewLine}{examples}{Environment.NewLine}{Environment.NewLine}This can affect race behavior, voice compatibility, and animations. Continue?",
+                "Change race and sex", MessageBoxButtons.YesNo, MessageBoxIcon.Warning);
             if (choice != DialogResult.Yes) return;
         }
 
@@ -810,7 +913,7 @@ internal sealed class MainForm : Form
         var copyBody = _copyBody.Checked;
         var replaceOutfit = _replaceOutfit.Checked;
         var assignments = _mappings.Select(m => new AppearanceAssignment(
-            m.ModName, m.Plugin, m.Source.OverriddenNpcName, m.Source.OriginalFormKey, m.Target.Name, m.Target.FormKeyText,
+            m.ModName, m.Plugin, m.Source.TransferName, m.Source.OriginalFormKey, m.Target.Name, m.Target.FormKeyText,
             m.Source.HasCustomSkin, m.Source.HasCustomBody, m.Source.HasNewOutfit,
             m.Source.AppearancePlugin, m.Source.AppearanceFormKey, m.Source.RaceKey, m.Source.IsFemale,
             m.Target.RaceKey, m.Target.IsFemale, m.Source.AppearanceMod,
@@ -842,15 +945,19 @@ internal sealed class MainForm : Form
                 replaceOutfit,
                 changeTargetRace));
             await RefreshProfileAsync();
+            var appliedLookCount = result.AppliedLookCount ?? assignments.Count;
+            var appliedOutfitCount = result.AppliedOutfitCount ?? outfitAssignments.Count;
             var completion = mode == AppearanceOutputMode.GalathilOutput
-                ? assignments.Count == 0
-                    && outfitAssignments.Count == 0
+                ? appliedLookCount == 0
+                    && appliedOutfitCount == 0
                     ? "Galathil Output was cleared. The output mod remains available for new mappings."
-                    : $"Updated Galathil Output with {assignments.Count} look mapping(s) and {outfitAssignments.Count} outfit assignment(s), {CountOutputPlugins(result.ModFolder)} ESPFE plugin(s), and one combined SkyPatcher config."
-                : $"Replaced {Path.GetFileName(result.PluginPath)} in {result.ModName} ({(result.SkyPatcherPath is null ? "one plugin" : "one plugin + SkyPatcher rule")}; no extra mod added).";
+                    : $"Updated Galathil Output with {appliedLookCount} look mapping(s) and {appliedOutfitCount} outfit assignment(s), {CountOutputPlugins(result.ModFolder)} ESPFE plugin(s). " +
+                      (appliedLookCount > 0 ? "FaceGen was renamed inside the linked asset mod(s). " : "") +
+                      "The plugins override the recipient NPCs directly; SkyPatcher is not needed."
+                : $"Replaced {Path.GetFileName(result.PluginPath)} in {result.ModName}. FaceGen was renamed to recipient IDs; no extra mod added.";
             SetBusy(false, completion);
             _statusText.ToolTipText = string.Join(Environment.NewLine, new[] { result.BackupPath, result.ModFolder }.Concat(result.Warnings));
-            var confirmation = $"Galathil finished successfully.{Environment.NewLine}{Environment.NewLine}{completion}{Environment.NewLine}{Environment.NewLine}Backup saved to:{Environment.NewLine}{result.BackupPath}";
+            var confirmation = $"Galathil finished successfully.{Environment.NewLine}{Environment.NewLine}{completion}{Environment.NewLine}{Environment.NewLine}Backup location:{Environment.NewLine}{result.BackupPath}";
             if (result.Warnings.Count > 0)
                 confirmation += $"{Environment.NewLine}{Environment.NewLine}Notes:{Environment.NewLine}{string.Join(Environment.NewLine, result.Warnings)}";
             MessageBox.Show(this, confirmation, "Galathil complete", MessageBoxButtons.OK, MessageBoxIcon.Information);
@@ -924,15 +1031,20 @@ internal sealed class MainForm : Form
         public BufferedListView() => DoubleBuffered = true;
     }
 
-    private static bool IsPluginFile(string path) => Path.GetExtension(path).ToLowerInvariant() is ".esp" or ".esm" or ".esl";
+    private static bool IsPluginFile(string path) =>
+        !PluginFileAccess.IsHiddenFile(path) && PluginFileAccess.TryGetPluginName(path, out _);
 
-    private sealed record PluginChoice(string Name, string Path, bool Active)
+    private sealed record PluginChoice(string Name, string Path, bool Active, bool Hidden)
     {
-        public override string ToString() => Active ? $"{Name}  (active)" : $"{Name}  (inactive)";
+        public override string ToString() => Active ? $"{Name}  (active)" : Hidden ? $"{Name}  (hidden by MO2)" : $"{Name}  (inactive)";
     }
 
     private sealed record NpcReplacement(string Name, string EditorId, string OriginalFormKey, string OverriddenNpcName, bool IsDirectOverride, string RaceKey, bool IsFemale, bool HasCustomSkin, bool HasCustomBody, bool HasNewOutfit,
-        string? AppearancePlugin = null, string? AppearanceFormKey = null, string? ExistingTargetFormKey = null, string? ExistingRouteProblem = null, string? AppearanceMod = null);
+        string? AppearancePlugin = null, string? AppearanceFormKey = null, string? ExistingTargetFormKey = null, string? ExistingRouteProblem = null, string? AppearanceMod = null)
+    {
+        public bool IsAddedNpc => !IsDirectOverride;
+        public string TransferName => IsDirectOverride ? OverriddenNpcName : Name;
+    }
     private sealed record TargetNpc(string Name, string EditorId, string FormKeyText, string WinningPlugin, string RaceKey, bool IsFemale);
     private sealed record MappingRow(string ModName, string Plugin, NpcReplacement Source, TargetNpc Target);
     private sealed record OutfitAssignmentRow(TargetNpc Target, ModOutfit Outfit);
@@ -955,6 +1067,7 @@ internal sealed class MainForm : Form
         public required List<string> ActivePluginOrder { get; init; }
         public required HashSet<string> ActivePlugins { get; init; }
         public required Dictionary<string, string> PluginPaths { get; init; }
+        public required Dictionary<string, string> ReadablePluginPaths { get; init; }
 
         public static ProfileContext Read(string instance, string profile)
         {
@@ -977,10 +1090,17 @@ internal sealed class MainForm : Form
             var active = new HashSet<string>(File.ReadLines(Path.Combine(profilePath, "plugins.txt"))
                 .Where(l => l.StartsWith('*')).Select(l => l[1..].Trim()), StringComparer.OrdinalIgnoreCase);
             var pluginPaths = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            var readablePluginPaths = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
             AddPluginFiles(dataPath, pluginPaths);
+            AddReadablePluginFiles(dataPath, readablePluginPaths);
             foreach (var mod in mods.Where(m => m.Enabled && !m.IsSeparator))
+            {
                 AddPluginFiles(Path.Combine(modsPath, mod.Name), pluginPaths);
+                AddReadablePluginFiles(Path.Combine(modsPath, mod.Name), readablePluginPaths);
+            }
             AddPluginFiles(Path.Combine(instance, "overwrite"), pluginPaths);
+            AddReadablePluginFiles(Path.Combine(instance, "overwrite"), readablePluginPaths);
+            foreach (var (name, path) in pluginPaths) readablePluginPaths[name] = path;
             var implicitMasters = new[] { "Skyrim.esm", "Update.esm", "Dawnguard.esm", "HearthFires.esm", "Dragonborn.esm", "_ResourcePack.esl" };
             // MO2 may omit the game's always-loaded masters from plugins.txt. Keep
             // them active for master checks when their files are present.
@@ -993,7 +1113,7 @@ internal sealed class MainForm : Form
             {
                 InstancePath = Path.GetFullPath(instance), ProfileName = profile, ProfilePath = profilePath,
                 ModsPath = modsPath, DataPath = dataPath, Mods = mods, ActivePluginOrder = loadOrder,
-                ActivePlugins = active, PluginPaths = pluginPaths
+                ActivePlugins = active, PluginPaths = pluginPaths, ReadablePluginPaths = readablePluginPaths
             };
         }
 
@@ -1002,6 +1122,19 @@ internal sealed class MainForm : Form
             if (!Directory.Exists(directory)) return;
             foreach (var path in Directory.EnumerateFiles(directory, "*.*", SearchOption.TopDirectoryOnly).Where(IsPluginFile))
                 index[Path.GetFileName(path)] = path;
+        }
+
+        private static void AddReadablePluginFiles(string directory, Dictionary<string, string> index)
+        {
+            if (!Directory.Exists(directory)) return;
+            var files = Directory.EnumerateFiles(directory, "*.*", SearchOption.TopDirectoryOnly)
+                .Select(path => PluginFileAccess.TryGetPluginName(path, out var name)
+                    ? (Path: path, Name: name, IsHidden: PluginFileAccess.IsHiddenFile(path))
+                    : (Path: path, Name: "", IsHidden: false))
+                .Where(file => file.Name.Length > 0)
+                .GroupBy(file => file.Name, StringComparer.OrdinalIgnoreCase);
+            foreach (var group in files)
+                index[group.Key] = group.OrderBy(file => file.IsHidden).First().Path;
         }
     }
 
@@ -1067,22 +1200,27 @@ internal sealed class MainForm : Form
 
         public static List<NpcReplacement> ReadNpcOverrides(string path, string pluginName, ProfileContext context, IReadOnlyList<TargetNpc> activeTargets)
         {
-            using var mod = SkyrimMod.CreateFromBinaryOverlay(path, SkyrimRelease.SkyrimSE);
+            using var modLease = PluginFileAccess.Open(pluginName, path);
+            var mod = modLease.Mod;
             var sourceNpcs = mod.Npcs.ToArray();
             var sourceModFolder = Path.GetDirectoryName(Path.GetFullPath(path))!;
-            var linkedMods = new Dictionary<string, ISkyrimModDisposableGetter>(StringComparer.OrdinalIgnoreCase);
+            var readablePluginPaths = new Dictionary<string, string>(context.ReadablePluginPaths, StringComparer.OrdinalIgnoreCase)
+            {
+                [pluginName] = path
+            };
+            var linkedMods = new Dictionary<string, PluginFileLease>(StringComparer.OrdinalIgnoreCase);
 
             ISkyrimModDisposableGetter? FindRecordMod(FormKey formKey)
             {
                 if (mod.ModKey == formKey.ModKey) return mod;
                 var fileName = formKey.ModKey.FileName.ToString();
-                if (linkedMods.TryGetValue(fileName, out var cached)) return cached;
-                if (!context.PluginPaths.TryGetValue(fileName, out var linkedPath)) return null;
+                if (linkedMods.TryGetValue(fileName, out var cached)) return cached.Mod;
+                if (!readablePluginPaths.TryGetValue(fileName, out var linkedPath)) return null;
                 try
                 {
-                    var linkedMod = SkyrimMod.CreateFromBinaryOverlay(linkedPath, SkyrimRelease.SkyrimSE);
+                    var linkedMod = PluginFileAccess.Open(fileName, linkedPath);
                     linkedMods[fileName] = linkedMod;
-                    return linkedMod;
+                    return linkedMod.Mod;
                 }
                 catch (Exception ex)
                 {
@@ -1305,8 +1443,8 @@ internal sealed class MainForm : Form
                     var originalKey = FormKeyText(npc.FormKey);
                     earlierNpcs.TryGetValue(originalKey, out var earlier);
                     var assets = DetectNpcAssets(npc);
-                    var hasNewOutfit = earlier is not null && npc.DefaultOutfit is { IsNull: false } &&
-                        npc.DefaultOutfit.FormKeyNullable != earlier.DefaultOutfit?.FormKeyNullable;
+                    var hasNewOutfit = npc.DefaultOutfit is { IsNull: false } &&
+                        (earlier is null || npc.DefaultOutfit.FormKeyNullable != earlier.DefaultOutfit?.FormKeyNullable);
                     var route = ExistingGalathilRoute(npc);
                     output.Add(new NpcReplacement(
                         DisplayName(npc.Name?.String, npc.EditorID, originalKey),

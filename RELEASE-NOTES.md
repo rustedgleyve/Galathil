@@ -1,11 +1,11 @@
-# Galathil 1.1.0
+# Galathil 1.2.9
 
-This release adds searchable Outfit assignments, including outfit-only changes, and reorganizes the interface into a three-column layout that follows MO2's mod priority order.
+**Tested only on Skyrim SE 1.6.1170.**
 
-Shared Galathil Output now carries a clean appearance record and supported linked appearance records, so the source replacer ESP can be disabled when nothing else requires it. Keep its MO2 asset mod enabled for its loose meshes and textures. Galathil leaves the source ESP enabled when an active plugin or unsupported record still depends on it.
+- An NPC can now receive a look and donate its own replacer look in the same batch. Arcadia can get Rayya's look while Camilla gets the look from the Arcadia replacer.
+- Galathil updates the tint filename inside transferred face meshes, including meshes that still point to an old follower tint or RaceMenu export.
+- This release also includes the changes since 1.1.0. Shared output uses light ESPs to apply swaps directly in Skyrim. It supports follower donors and outfit-only mappings, hides original ESPs when safe, and clears saved mappings for deleted mods the next time you apply.
 
-This release also fixes recipient FaceGen paths and keeps the appearance helper's race and gender aligned with the donor. Existing output and asset-note changes remain backed up.
+Extract the Windows x64 ZIP and launch `Galathil.exe` from Mod Organizer 2. It uses the x64 .NET 10 Desktop Runtime. [Download the desktop runtime](https://dotnet.microsoft.com/en-us/download/dotnet/10.0)
 
-**Tested only on Skyrim SE 1.6.1170.** Requires Windows x64, Mod Organizer 2, the .NET 10 Desktop Runtime, and SkyPatcher for shared output.
-
-See [CHANGELOG.md](CHANGELOG.md) for the full list of changes.
+[Full changelog](https://github.com/rustedgleyve/Galathil/blob/v1.2.9/CHANGELOG.md)

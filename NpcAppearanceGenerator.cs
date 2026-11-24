@@ -2,6 +2,8 @@ using System.Globalization;
 using System.Diagnostics;
 using System.IO.Compression;
 using System.IO.Abstractions;
+using System.Buffers.Binary;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
@@ -18,8 +20,7 @@ using Noggog;
 internal enum AppearanceOutputMode
 {
     GalathilOutput,
-    EspfePatch,
-    SkyPatcher
+    EspfePatch
 }
 
 internal sealed record AppearanceAssignment(
@@ -68,9 +69,11 @@ internal sealed record GalathilOutputManifest(
     IReadOnlyDictionary<string, int>? SourcePluginLoadOrder = null,
     bool? ProvideModOutfit = null,
     IReadOnlyList<OutfitAssignment>? OutfitAssignments = null,
-    IReadOnlyDictionary<string, IReadOnlyList<string>>? AssetMarkerFiles = null);
+    IReadOnlyDictionary<string, IReadOnlyList<string>>? AssetMarkerFiles = null,
+    IReadOnlyList<GalathilFaceGenLink>? FaceGenLinks = null);
 
 internal sealed record GalathilAssetLink(string SourceMod, string SourcePlugin);
+internal sealed record GalathilFaceGenLink(string AssetMod, string SourcePlugin, string TargetFormKey, string MeshSha256, string TintSha256);
 
 internal sealed record GalathilModEntry(string Name, bool Enabled);
 
@@ -80,7 +83,9 @@ internal sealed record AppearanceGenerationResult(
     string? PluginPath,
     string? SkyPatcherPath,
     string BackupPath,
-    IReadOnlyList<string> Warnings);
+    IReadOnlyList<string> Warnings,
+    int? AppliedLookCount = null,
+    int? AppliedOutfitCount = null);
 
 internal sealed class LightPluginFormIdCapacityException(FormKey formKey)
     : Exception($"The new NPC record {formKey} would exceed the ESL local FormID range.")
@@ -117,23 +122,26 @@ internal static class NpcAppearanceGenerator
     {
         if (mode == AppearanceOutputMode.GalathilOutput)
             return GenerateGalathilOutput(instancePath, profileName, profilePath, modsPath, dataPath,
-                activePluginOrder, activePlugins, pluginPaths, modOrder, assignments, outfitAssignments, copySkin, copyBody, replaceOutfit);
+                activePluginOrder, activePlugins, pluginPaths, modOrder, assignments, outfitAssignments,
+                copySkin, copyBody, replaceOutfit, changeTargetRace);
+
+        if (assignments.Any(a => IsAddedNpcFormKey(a.SourceFormKey, a.SourcePlugin)))
+            throw new InvalidOperationException("An NPC added by a follower mod can only supply its look through Galathil Output ESP. Choose an existing NPC as the recipient.");
 
         if (outfitAssignments.Count > 0)
-            throw new InvalidOperationException("New outfit assignments require Galathil Output + SkyPatcher. Choose that output type before applying.");
+            throw new InvalidOperationException("New outfit assignments require Galathil Output ESP. Choose that output type before applying.");
 
         if (assignments.Count == 0) throw new InvalidOperationException("Add an appearance assignment first.");
         var sourceMods = assignments.Select(a => a.SourceMod).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
         var sourcePlugins = assignments.Select(a => a.SourcePlugin).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
         if (sourceMods.Length != 1 || sourcePlugins.Length != 1)
             throw new InvalidOperationException("Apply one source mod/plugin at a time. This lets Galathil safely replace that ESP without adding another plugin.");
-        if (mode == AppearanceOutputMode.SkyPatcher &&
-            !modOrder.Any(m => m.Enabled && m.Name.Contains("SkyPatcher", StringComparison.OrdinalIgnoreCase)))
-            throw new InvalidOperationException("SkyPatcher is not enabled in this MO2 profile.");
-
         var duplicateTargets = assignments.GroupBy(a => a.TargetFormKey, StringComparer.OrdinalIgnoreCase).FirstOrDefault(g => g.Count() > 1);
         if (duplicateTargets is not null)
             throw new InvalidOperationException($"More than one look is assigned to {duplicateTargets.First().TargetName}. Remove one assignment before creating the mod.");
+        var sourceKeys = assignments.Select(a => NormalizeFormKey(a.SourceFormKey)).ToHashSet(StringComparer.OrdinalIgnoreCase);
+        if (assignments.Any(a => sourceKeys.Contains(NormalizeFormKey(a.TargetFormKey))))
+            throw new InvalidOperationException("A recipient in this batch is also a source NPC. Apply those transfers one at a time so Galathil can keep each appearance with the correct FormID.");
 
         foreach (var assignment in assignments)
         {
@@ -175,25 +183,41 @@ internal static class NpcAppearanceGenerator
             if (laterNonGalathil is not null)
                 throw new InvalidOperationException($"{assignment.SourceName} is overwritten by '{laterNonGalathil.Plugin}' after '{assignment.SourcePlugin}'. Choose the active winning replacer instead.");
             if (sourceIndex == 0)
-                throw new InvalidOperationException($"Could not find the earlier version of {assignment.SourceName} needed to restore its original appearance.");
+                throw new InvalidOperationException($"{assignment.SourceName} is not an override in {assignment.SourcePlugin}. Direct replacement only works for an existing NPC replacer.");
 
             var source = sourceChain[sourceIndex].Record;
             var beforeSource = sourceChain[sourceIndex - 1].Record;
+            var appearance = source;
+            var appearanceKey = source.FormKey;
+            if (!string.IsNullOrWhiteSpace(assignment.AppearanceFormKey))
+            {
+                var appearancePlugin = assignment.AppearancePlugin ?? sourcePlugin;
+                if (!appearancePlugin.Equals(sourcePlugin, StringComparison.OrdinalIgnoreCase))
+                    throw new InvalidOperationException($"The saved Galathil appearance for {assignment.SourceName} is stored in {appearancePlugin}. Direct replacement can only simplify a route whose appearance record is in {sourcePlugin}; restore or convert that route through Galathil Output ESP first.");
+                appearanceKey = ParseOutfitFormKey(assignment.AppearanceFormKey, assignment.SourceName);
+                using var appearanceLease = PluginFileAccess.Open(sourcePlugin, sourcePluginPath);
+                appearance = appearanceLease.Mod.Npcs.FirstOrDefault(n => n.FormKey == appearanceKey)?.DeepCopy()
+                    ?? throw new InvalidOperationException($"The saved Galathil appearance record {FormKeyText(appearanceKey)} is missing from {sourcePlugin}. Restore the matching Galathil backup first.");
+                if (string.IsNullOrWhiteSpace(appearance.EditorID) || !appearance.EditorID.StartsWith("GALATHIL_", StringComparison.OrdinalIgnoreCase))
+                    throw new InvalidOperationException($"The appearance record {FormKeyText(appearanceKey)} is not a Galathil helper NPC. Galathil will not delete an unrelated NPC record.");
+            }
             var targetChain = GetChain(npcChains, assignment.TargetFormKey, assignment.TargetName);
             var target = targetChain[^1].Record;
+            if (source.FormKey == target.FormKey)
+                throw new InvalidOperationException($"{assignment.SourceName} and {assignment.TargetName} resolve to the same NPC record.");
             if (mode == AppearanceOutputMode.EspfePatch)
             {
                 var sourceOrder = activePluginOrder.IndexOf(sourcePlugin);
                 var targetWinnerOrder = activePluginOrder.IndexOf(targetChain[^1].Plugin);
                 if (sourceOrder < 0 || targetWinnerOrder < 0 || targetWinnerOrder >= sourceOrder)
-                    throw new InvalidOperationException($"The source plugin loads before {targetChain[^1].Plugin}, which currently wins for {assignment.TargetName}. An in-place ESP cannot safely override it; choose SkyPatcher or move the target's winning plugin earlier.");
+                    throw new InvalidOperationException($"The source plugin loads before {targetChain[^1].Plugin}, which currently wins for {assignment.TargetName}. An in-place ESP cannot safely override it; choose Galathil Output ESP or move the target's winning plugin earlier.");
             }
-            var sourceFemale = IsFemale(source);
+            var sourceFemale = IsFemale(appearance);
             var targetFemale = IsFemale(target);
             if (sourceFemale != targetFemale && mode == AppearanceOutputMode.EspfePatch)
-                throw new InvalidOperationException($"{assignment.SourceName} and {assignment.TargetName} have different genders. Use a SkyPatcher output to transfer this look.");
+                throw new InvalidOperationException($"{assignment.SourceName} and {assignment.TargetName} have different genders. Use Galathil Output ESP to transfer this look.");
 
-            var raceMismatch = source.Race.FormKey != target.Race.FormKey;
+            var raceMismatch = appearance.Race.FormKey != target.Race.FormKey;
             if (raceMismatch && !changeTargetRace)
                 warnings.Add($"{assignment.TargetName} keeps its original race; its appearance may not match perfectly because it differs from {assignment.SourceName}.");
             else if (raceMismatch)
@@ -204,20 +228,31 @@ internal static class NpcAppearanceGenerator
                 warnings.Add($"{assignment.TargetName} keeps its current skin and body. Select Skin or Body to use {assignment.SourceName}'s unique assets.");
             if (assignment.HasCustomSkin && assignment.HasCustomBody && copySkin != copyBody)
                 warnings.Add($"{assignment.SourceName}'s unique skin textures and body mesh are linked through the same Skyrim skin record. Copying either applies that linked record, so both may transfer together.");
-            var hasNewOutfit = source.DefaultOutfit is { IsNull: false } &&
-                source.DefaultOutfit.FormKeyNullable != beforeSource.DefaultOutfit?.FormKeyNullable;
+            var hasNewOutfit = assignment.HasNewOutfit || (appearance.DefaultOutfit is { IsNull: false } &&
+                appearance.DefaultOutfit.FormKeyNullable != beforeSource.DefaultOutfit?.FormKeyNullable);
             if (hasNewOutfit && !replaceOutfit)
                 warnings.Add($"{assignment.TargetName} keeps its own outfit because Replace Outfit was not selected.");
 
-            var sourceFace = assetResolver.ReadCurrentReplacerFaceGen(assignment.SourceMod, source.FormKey, warnings);
-            var restoredFace = assetResolver.ReadEarlierFaceGen(assignment.SourceMod, sourceChain[sourceIndex - 1].Plugin, beforeSource.FormKey);
-            if (AppearanceSignature(source, includeSkin: true, includeOutfit: true).Equals(AppearanceSignature(beforeSource, includeSkin: true, includeOutfit: true), StringComparison.Ordinal) &&
-                sourceFace.Mesh.AsSpan().SequenceEqual(restoredFace.Mesh) &&
-                sourceFace.Tint.AsSpan().SequenceEqual(restoredFace.Tint))
-                throw new InvalidOperationException($"{assignment.SourceName} already has the earlier appearance and FaceGen. Restore the matching Galathil backup before redirecting this NPC again.");
-            prepared.Add(new PreparedAssignment(assignment, source, beforeSource, target, sourceFace, restoredFace,
+            assetResolver.EnsureRecipientFaceGenWillWin(assignment.SourceMod, target.FormKey, assignment.TargetName);
+            FaceGenFiles sourceFace;
+            try
+            {
+                sourceFace = assetResolver.ReadCurrentReplacerFaceGen(assignment.SourceMod, appearanceKey, warnings);
+            }
+            catch (Exception ex) when (!string.IsNullOrWhiteSpace(assignment.AppearanceFormKey) && ex is FileNotFoundException or InvalidDataException)
+            {
+                sourceFace = ReadLegacyGalathilFaceGenBackup(assignment.SourceMod, source.FormKey, warnings);
+            }
+            if (assetResolver.HasArchivedFaceGen(assignment.SourceMod, source.FormKey) ||
+                (appearanceKey != source.FormKey && assetResolver.HasArchivedFaceGen(assignment.SourceMod, appearanceKey)))
+                throw new InvalidOperationException($"FaceGen for {assignment.SourceName} is stored in a BSA inside the source mod. Galathil cannot remove those archived donor-ID files safely; extract the replacer's FaceGen to loose files first, then try again.");
+
+            prepared.Add(new PreparedAssignment(assignment, source, appearance, beforeSource, target, sourceFace,
                 raceMismatch && changeTargetRace, copySourceSkinArmor, replaceOutfit && hasNewOutfit));
         }
+
+        var targetKeys = prepared.Select(item => item.Target.FormKey).ToHashSet();
+        var obsoleteSourceFiles = CollectInPlaceFilesToRemove(sourceModFolder, sourcePlugin, prepared, targetKeys);
 
         var pluginFileName = sourcePlugin;
         var stageFolder = Path.Combine(Path.GetTempPath(), "Galathil", Guid.NewGuid().ToString("N"));
@@ -226,8 +261,6 @@ internal static class NpcAppearanceGenerator
         string? pluginPath = null;
         string? skyPatcherPath = null;
         string? backupPath = null;
-        var skyClones = new List<(PreparedAssignment Assignment, FormKey CloneKey)>();
-        var createdSkyNpcKeys = new HashSet<FormKey>();
         var expectedFaceGen = new Dictionary<FormKey, FaceGenFiles>();
         var originalDeletedNpcCount = 0;
         try
@@ -238,59 +271,42 @@ internal static class NpcAppearanceGenerator
                 .Construct();
             var requiresLightFlag = output.ModHeader.Flags.HasFlag(SkyrimModHeader.HeaderFlag.Small);
             originalDeletedNpcCount = output.Npcs.Count(n => n.IsDeleted);
-            var originalGroupCounts = CountMajorRecordGroups(output);
 
             foreach (var item in prepared)
             {
-                var sourceSignature = AppearanceSignature(item.Source, includeSkin: true, includeOutfit: true);
-                var oldSourceSignature = AppearanceSignature(item.BeforeSource, includeSkin: true, includeOutfit: true);
-                if (!sourceSignature.Equals(oldSourceSignature, StringComparison.Ordinal))
+                var targetWinner = GetChain(npcChains, item.Assignment.TargetFormKey, item.Assignment.TargetName)[^1].Plugin;
+                var requiredPlugins = new List<string> { item.Target.FormKey.ModKey.FileName.ToString(), targetWinner };
+                foreach (var requiredPlugin in requiredPlugins.Distinct(StringComparer.OrdinalIgnoreCase))
                 {
-                    var restore = output.Npcs.GetOrAddAsOverride(item.Source);
-                    CopyAppearance(restore, item.BeforeSource, includeRace: false, includeSkin: true, includeOutfit: true);
+                    if (requiredPlugin.Equals(output.ModKey.FileName, StringComparison.OrdinalIgnoreCase)) continue;
+                    if (!output.ModHeader.MasterReferences.Any(m => StringComparer.OrdinalIgnoreCase.Equals(m.Master.FileName.ToString(), requiredPlugin)))
+                        throw new InvalidOperationException($"{pluginFileName} does not already require {requiredPlugin}. Galathil will not add a new master to the source plugin; use Galathil Output ESP for this target.");
                 }
 
-                if (mode == AppearanceOutputMode.EspfePatch)
-                {
-                    var targetWinner = GetChain(npcChains, item.Assignment.TargetFormKey, item.Assignment.TargetName)[^1].Plugin;
-                    var requiredPlugins = new List<string> { item.Target.FormKey.ModKey.FileName.ToString(), targetWinner };
-                    foreach (var requiredPlugin in requiredPlugins.Distinct(StringComparer.OrdinalIgnoreCase))
-                    {
-                        if (requiredPlugin.Equals(output.ModKey.FileName, StringComparison.OrdinalIgnoreCase)) continue;
-                        if (!output.ModHeader.MasterReferences.Any(m => StringComparer.OrdinalIgnoreCase.Equals(m.Master.FileName.ToString(), requiredPlugin)))
-                            throw new InvalidOperationException($"{pluginFileName} does not already require {requiredPlugin}. Galathil will not add a new master to the source plugin; use SkyPatcher for this target.");
-                    }
-                    var transferOutfit = item.CopyOutfit ? item.Source.DefaultOutfit?.FormKeyNullable : null;
-                    var shouldCopyOutfit = item.CopyOutfit;
-                    var outfitChanged = shouldCopyOutfit && item.Target.DefaultOutfit?.FormKeyNullable != transferOutfit;
-                    var appearanceChanged = !AppearanceSignature(item.Target, item.CopySkinArmor).Equals(
-                        AppearanceSignature(item.Source, item.CopySkinArmor), StringComparison.Ordinal);
-                    if (item.CopyRace || appearanceChanged || outfitChanged)
-                    {
-                        var targetOverride = output.Npcs.GetOrAddAsOverride(item.Target);
-                        CopyAppearance(targetOverride, item.Source, item.CopyRace, item.CopySkinArmor, includeOutfit: false);
-                        if (shouldCopyOutfit) targetOverride.DefaultOutfit = new FormLinkNullable<IOutfitGetter>(transferOutfit);
-                    }
+                var targetOverride = output.Npcs.GetOrAddAsOverride(item.Target);
+                CopyAppearance(targetOverride, item.Appearance, item.CopyRace, item.CopySkinArmor, includeOutfit: false);
+                if (item.CopyOutfit)
+                    targetOverride.DefaultOutfit = new FormLinkNullable<IOutfitGetter>(item.Appearance.DefaultOutfit?.FormKeyNullable);
 
-                    WriteFaceGen(stageFolder, item.Target.FormKey, item.SourceFaceGen);
-                    expectedFaceGen[item.Target.FormKey] = item.SourceFaceGen;
-                }
-                else
-                {
-                    FormKey? cloneFormKey = requiresLightFlag ? FindFreeLightFormKey(output) : null;
-                    var clone = output.Npcs.DuplicateInAsNewRecord(item.Source, cloneFormKey);
-                    clone.EditorID = MakeEditorId(item.Source, clone.FormKey);
-                    createdSkyNpcKeys.Add(clone.FormKey);
-                    WriteFaceGen(stageFolder, clone.FormKey, item.SourceFaceGen);
-                    expectedFaceGen[clone.FormKey] = item.SourceFaceGen;
-                    skyClones.Add((item, clone.FormKey));
-                }
-
-                WriteFaceGen(stageFolder, item.Source.FormKey, item.PreviousFaceGen);
-                expectedFaceGen[item.Source.FormKey] = item.PreviousFaceGen;
+                var targetFaceGen = RekeyFaceGen(item.SourceFaceGen, item.Source.FormKey, item.Appearance.FormKey, item.Target.FormKey);
+                WriteFaceGen(stageFolder, item.Target.FormKey, targetFaceGen);
+                expectedFaceGen[item.Target.FormKey] = targetFaceGen;
             }
 
-            if (requiresLightFlag) ValidateLightPlugin(output, createdSkyNpcKeys);
+            var removedNpcKeys = new HashSet<FormKey>();
+            foreach (var sourceKey in prepared.Select(item => item.Source.FormKey).Distinct())
+            {
+                if (targetKeys.Contains(sourceKey)) continue;
+                output.Npcs.Remove(sourceKey);
+                removedNpcKeys.Add(sourceKey);
+            }
+            foreach (var item in prepared)
+            {
+                if (item.Appearance.FormKey == item.Source.FormKey || targetKeys.Contains(item.Appearance.FormKey)) continue;
+                output.Npcs.Remove(item.Appearance.FormKey);
+                removedNpcKeys.Add(item.Appearance.FormKey);
+            }
+
             pluginPath = Path.Combine(stageFolder, pluginFileName);
             output.WriteToBinary(pluginPath, BinaryWriteParameters.Default with
             {
@@ -302,37 +318,42 @@ internal static class NpcAppearanceGenerator
             var expectedFlags = output.ModHeader.Flags;
             ValidateWrittenPlugin(pluginPath, output.ModKey, expectedGroupCounts, expectedMasters, expectedFlags, requiresLightFlag, originalDeletedNpcCount);
 
-            if (mode == AppearanceOutputMode.SkyPatcher)
-            {
-                var configFolder = Path.Combine(stageFolder, "SKSE", "Plugins", "SkyPatcher", "npc");
-                Directory.CreateDirectory(configFolder);
-                skyPatcherPath = Path.Combine(configFolder, "Galathil_" + SafeFileStem(Path.GetFileNameWithoutExtension(sourcePlugin)) + ".ini");
-                File.WriteAllText(skyPatcherPath, BuildSkyPatcherConfig(skyClones, pluginFileName), new UTF8Encoding(false));
-            }
-
             var stagedFiles = Directory.GetFiles(stageFolder, "*", SearchOption.AllDirectories);
             var replacedFiles = stagedFiles.Select(path => (Stage: path, Relative: Path.GetRelativePath(stageFolder, path), Destination: Path.Combine(sourceModFolder, Path.GetRelativePath(stageFolder, path)))).ToList();
-            var existingFiles = replacedFiles.Where(f => File.Exists(f.Destination)).Select(f => f.Relative).ToHashSet(StringComparer.OrdinalIgnoreCase);
+            var touchedFiles = replacedFiles.Select(f => f.Relative)
+                .Concat(obsoleteSourceFiles.Keys)
+                .Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
+            var existingFiles = replacedFiles.Where(f => File.Exists(f.Destination)).Select(f => f.Relative)
+                .Concat(obsoleteSourceFiles.Keys)
+                .ToHashSet(StringComparer.OrdinalIgnoreCase);
             var backupFolder = Path.Combine(AppContext.BaseDirectory, "Backups", SafeFileStem(sourceMod), DateTime.Now.ToString("yyyyMMdd-HHmmssfff", CultureInfo.InvariantCulture));
             Directory.CreateDirectory(backupFolder);
             backupPath = Path.Combine(backupFolder, "source-files.zip");
             var backupNotes =
                 $"Galathil replaced {sourcePlugin} in place for profile '{profileName}'.\r\n" +
                 string.Join("\r\n", assignments.Select(a => $"{a.SourceName} ({a.SourceFormKey}) -> {a.TargetName} ({a.TargetFormKey})")) +
-                "\r\n\r\nFiles written (restore files in the ZIP and remove entries absent from it to undo):\r\n" +
-                string.Join("\r\n", replacedFiles.Select(f => f.Relative));
-            CreateBackupArchive(backupPath, sourceModFolder, replacedFiles.Where(f => existingFiles.Contains(f.Relative)).Select(f => f.Destination), backupNotes);
+                "\r\n\r\nFiles written:\r\n" + string.Join("\r\n", replacedFiles.Select(f => f.Relative)) +
+                "\r\n\r\nDonor FaceGen and old Galathil route files removed:\r\n" + string.Join("\r\n", obsoleteSourceFiles.Keys) +
+                "\r\n\r\nRestore the ZIP to undo; remove entries absent from it.";
+            var backupFiles = replacedFiles.Where(f => existingFiles.Contains(f.Relative)).Select(f => f.Destination)
+                .Concat(obsoleteSourceFiles.Keys.Select(relative => Path.Combine(sourceModFolder, relative)));
+            CreateBackupArchive(backupPath, sourceModFolder, backupFiles, backupNotes);
 
             try
             {
                 foreach (var file in replacedFiles) ReplaceFileAtomically(file.Stage, file.Destination);
+                foreach (var (relative, originalBytes) in obsoleteSourceFiles)
+                {
+                    var path = Path.Combine(sourceModFolder, relative);
+                    if (!File.Exists(path)) continue;
+                    if (!File.ReadAllBytes(path).AsSpan().SequenceEqual(originalBytes))
+                        throw new IOException($"{relative} changed while Galathil was preparing the transfer. No files were removed; try again.");
+                    File.Delete(path);
+                }
                 ValidateWrittenPlugin(sourcePluginPath, ModKey.FromFileName(sourcePlugin), expectedGroupCounts, expectedMasters, expectedFlags, requiresLightFlag, originalDeletedNpcCount);
                 ValidateWrittenFaceGen(sourceModFolder, expectedFaceGen);
-                if (skyPatcherPath is not null)
-                {
-                    skyPatcherPath = Path.Combine(sourceModFolder, Path.GetRelativePath(stageFolder, skyPatcherPath));
-                    if (!File.Exists(skyPatcherPath)) throw new InvalidDataException("The SkyPatcher rule was not written into the source mod.");
-                }
+                ValidateRemovedNpcRecords(sourcePluginPath, removedNpcKeys);
+                ValidateRemovedDonorFaceGen(sourceModFolder, prepared, targetKeys);
                 pluginPath = sourcePluginPath;
 
                 var obsoleteMods = FindSupersededGalathilMods(modsPath, modOrder, assignments);
@@ -351,32 +372,10 @@ internal static class NpcAppearanceGenerator
             }
             catch
             {
-                RestoreBackupArchive(backupPath, sourceModFolder, replacedFiles.Select(f => f.Relative), existingFiles);
+                RestoreBackupArchive(backupPath, sourceModFolder, touchedFiles, existingFiles);
                 throw;
             }
             return new AppearanceGenerationResult(sourceMod, sourceModFolder, pluginPath, skyPatcherPath, backupPath, warnings);
-        }
-        catch (LightPluginFormIdCapacityException capacityError) when (mode == AppearanceOutputMode.SkyPatcher)
-        {
-            if (Directory.Exists(stageFolder)) Directory.Delete(stageFolder, recursive: true);
-            try
-            {
-                var directResult = Generate(
-                    instancePath, profileName, profilePath, modsPath, dataPath,
-                    activePluginOrder, activePlugins, pluginPaths, modOrder, assignments, Array.Empty<OutfitAssignment>(),
-                    AppearanceOutputMode.EspfePatch, copySkin, copyBody, replaceOutfit, changeTargetRace);
-                return directResult with
-                {
-                    Warnings = directResult.Warnings.Append(
-                        $"SkyPatcher could not fit its appearance NPC into the source ESL ({capacityError.FormKey} exceeds the light-plugin ID range), so Galathil used a direct in-place ESP transfer instead.").ToArray()
-                };
-            }
-            catch (Exception directError)
-            {
-                throw new InvalidOperationException(
-                    $"SkyPatcher needs a new NPC record, but {capacityError.FormKey} would exceed the source ESL's ID range. The direct in-place fallback was also blocked: {directError.Message}",
-                    directError);
-            }
         }
         catch
         {
@@ -399,16 +398,46 @@ internal static class NpcAppearanceGenerator
         IReadOnlyList<OutfitAssignment> outfitAssignments,
         bool copySkin,
         bool copyBody,
-        bool replaceOutfit)
+        bool replaceOutfit,
+        bool changeTargetRace)
     {
-        if ((assignments.Count > 0 || outfitAssignments.Count > 0) && !modOrder.Any(m => m.Enabled && m.Name.Contains("SkyPatcher", StringComparison.OrdinalIgnoreCase)))
-            throw new InvalidOperationException("SkyPatcher is not enabled in this MO2 profile.");
         if (Process.GetProcessesByName("SkyrimSE").Length > 0)
-            throw new InvalidOperationException("Close Skyrim before updating Galathil Output.");
+            throw new InvalidOperationException("Close Skyrim before updating Galathil Output ESPs.");
+
+        var warnings = new List<string>();
+        var missingSourceMods = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var liveAssignments = new List<AppearanceAssignment>();
+        foreach (var assignment in assignments)
+        {
+            var sourceFolder = Path.GetFullPath(Path.Combine(modsPath, assignment.SourceMod));
+            var sourcePluginExists = IsChildPath(modsPath, sourceFolder) && Directory.Exists(sourceFolder) &&
+                PluginFileAccess.FindInModFolder(sourceFolder, assignment.SourcePlugin) is not null;
+            if (sourcePluginExists)
+            {
+                liveAssignments.Add(assignment);
+                continue;
+            }
+            missingSourceMods.Add(assignment.SourceMod);
+        }
+        assignments = liveAssignments;
+        var liveOutfitAssignments = outfitAssignments.Where(assignment =>
+        {
+            if (assignment.OutfitModName.Equals("Game Data", StringComparison.OrdinalIgnoreCase)) return true;
+            var folder = Path.GetFullPath(Path.Combine(modsPath, assignment.OutfitModName));
+            var exists = IsChildPath(modsPath, folder) && Directory.Exists(folder) &&
+                (PluginFileAccess.FindInModFolder(folder, assignment.OutfitWinningPlugin) is not null ||
+                 PluginFileAccess.FindInModFolder(folder, assignment.OutfitPlugin) is not null);
+            if (!exists) missingSourceMods.Add(assignment.OutfitModName);
+            return exists;
+        }).ToArray();
+        outfitAssignments = liveOutfitAssignments;
+        if (missingSourceMods.Count > 0)
+            warnings.Add($"Removed saved look or outfit entries from missing mods: {string.Join(", ", missingSourceMods.OrderBy(name => name, StringComparer.OrdinalIgnoreCase))}. Galathil Output will be rebuilt without them.");
 
         var duplicateTargets = assignments.GroupBy(a => NormalizeFormKey(a.TargetFormKey), StringComparer.OrdinalIgnoreCase).FirstOrDefault(g => g.Count() > 1);
         if (duplicateTargets is not null)
             throw new InvalidOperationException($"More than one look is assigned to {duplicateTargets.First().TargetName}. Remove one assignment before creating the output.");
+        var sourceKeys = assignments.Select(a => NormalizeFormKey(a.SourceFormKey)).ToHashSet(StringComparer.OrdinalIgnoreCase);
         var duplicateOutfitTargets = outfitAssignments.GroupBy(a => NormalizeFormKey(a.TargetFormKey), StringComparer.OrdinalIgnoreCase).FirstOrDefault(g => g.Count() > 1);
         if (duplicateOutfitTargets is not null)
             throw new InvalidOperationException($"More than one outfit is assigned to {duplicateOutfitTargets.First().TargetName}. Remove one outfit assignment before creating the output.");
@@ -416,17 +445,30 @@ internal static class NpcAppearanceGenerator
         foreach (var outfitAssignment in outfitAssignments)
             ValidateOutfitAssignment(outfitAssignment, activePlugins, pluginPaths);
 
+        var sourcePluginReadPaths = new Dictionary<string, string>(pluginPaths, StringComparer.OrdinalIgnoreCase);
+        var selectedSourcePluginPaths = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         foreach (var assignment in assignments)
         {
             if (!modOrder.Any(m => m.Enabled && m.Name.Equals(assignment.SourceMod, StringComparison.OrdinalIgnoreCase)))
                 throw new InvalidOperationException($"The source mod '{assignment.SourceMod}' is disabled in this MO2 profile.");
             var sourceFolder = Path.GetFullPath(Path.Combine(modsPath, assignment.SourceMod));
-            var sourcePluginPath = Path.GetFullPath(Path.Combine(sourceFolder, assignment.SourcePlugin));
-            if (!IsChildPath(modsPath, sourceFolder) || !IsChildPath(sourceFolder, sourcePluginPath) || !File.Exists(sourcePluginPath))
+            if (!IsChildPath(modsPath, sourceFolder))
+                throw new InvalidOperationException($"The source mod folder '{assignment.SourceMod}' is outside the MO2 mods folder.");
+            var sourcePluginPath = PluginFileAccess.FindInModFolder(sourceFolder, assignment.SourcePlugin);
+            if (sourcePluginPath is null)
                 throw new InvalidOperationException($"Could not find {assignment.SourcePlugin} inside the selected MO2 mod '{assignment.SourceMod}'.");
-            if (!pluginPaths.TryGetValue(assignment.SourcePlugin, out var activePath) ||
-                !Path.GetFullPath(activePath).Equals(sourcePluginPath, StringComparison.OrdinalIgnoreCase))
+            sourcePluginPath = Path.GetFullPath(sourcePluginPath);
+            if (!IsChildPath(sourceFolder, sourcePluginPath))
+                throw new InvalidOperationException($"The plugin path for {assignment.SourcePlugin} is outside the selected MO2 mod folder.");
+            if (activePlugins.Contains(assignment.SourcePlugin) &&
+                (!pluginPaths.TryGetValue(assignment.SourcePlugin, out var activePath) ||
+                 !Path.GetFullPath(activePath).Equals(sourcePluginPath, StringComparison.OrdinalIgnoreCase)))
                 throw new InvalidOperationException($"Another mod is overriding {assignment.SourcePlugin}. Select the active MO2 winner for this replacer.");
+            if (selectedSourcePluginPaths.TryGetValue(assignment.SourcePlugin, out var existingSourcePath) &&
+                !Path.GetFullPath(existingSourcePath).Equals(sourcePluginPath, StringComparison.OrdinalIgnoreCase))
+                throw new InvalidOperationException($"More than one selected mod contains {assignment.SourcePlugin}. Choose one source mod for that plugin.");
+            selectedSourcePluginPaths[assignment.SourcePlugin] = sourcePluginPath;
+            sourcePluginReadPaths[assignment.SourcePlugin] = sourcePluginPath;
         }
 
         var outputFolder = Path.GetFullPath(Path.Combine(modsPath, OutputModName));
@@ -439,8 +481,15 @@ internal static class NpcAppearanceGenerator
                 ?? throw new InvalidDataException("The saved Galathil Output plan is empty or damaged.")
             : null;
         var sourcePlugins = assignments.Select(a => a.SourcePlugin).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
-        var previouslyManagedDisabled = (previousManifest?.DisabledSourcePlugins ?? Array.Empty<string>())
+        var priorDisabledPlugins = (previousManifest?.DisabledSourcePlugins ?? Array.Empty<string>())
             .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var availablePriorDisabledPlugins = priorDisabledPlugins.Where(plugin => IsPluginAvailable(
+            modsPath, dataPath, modOrder, activePlugins, pluginPaths, plugin)).ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var forgottenSourcePlugins = priorDisabledPlugins.Where(plugin => !activePlugins.Contains(plugin) &&
+            !availablePriorDisabledPlugins.Contains(plugin)).ToArray();
+        var previouslyManagedDisabled = availablePriorDisabledPlugins;
+        if (forgottenSourcePlugins.Length > 0)
+            warnings.Add($"Removed stale profile entries for deleted source plugins: {string.Join(", ", forgottenSourcePlugins)}.");
         var outputMasterOrder = activePluginOrder.ToList();
         foreach (var sourcePlugin in sourcePlugins.Where(name => !activePlugins.Contains(name)))
         {
@@ -461,46 +510,56 @@ internal static class NpcAppearanceGenerator
         foreach (var outfitAssignment in outfitAssignments)
             _ = GetChain(npcChains, NormalizeFormKey(outfitAssignment.TargetFormKey), outfitAssignment.TargetName);
         var prepared = new List<SharedPreparedAssignment>();
-        var warnings = new List<string>();
         var assetResolver = new FaceGenAssetResolver(modsPath, dataPath, modOrder, pluginPaths);
+        var previousFaceGen = IndexManagedFaceGenFiles(modsPath, modOrder, previousManifest?.FaceGenLinks, warnings);
 
         foreach (var assignment in assignments)
         {
-            var sourceModFolder = Path.GetFullPath(Path.Combine(modsPath, assignment.SourceMod));
-            var sourcePluginPath = Path.GetFullPath(Path.Combine(sourceModFolder, assignment.SourcePlugin));
-            var sourceChain = GetChain(npcChains, NormalizeFormKey(assignment.SourceFormKey), assignment.SourceName);
+            var sourcePluginPath = sourcePluginReadPaths[assignment.SourcePlugin];
+            var normalizedSourceKey = NormalizeFormKey(assignment.SourceFormKey);
+            List<PluginNpc> sourceChain = npcChains.TryGetValue(normalizedSourceKey, out var activeSourceChain) ? activeSourceChain : [];
             var sourceIndex = sourceChain.FindIndex(r => r.Plugin.Equals(assignment.SourcePlugin, StringComparison.OrdinalIgnoreCase));
             var sourcePluginActive = activePlugins.Contains(assignment.SourcePlugin);
             Npc source;
             Npc beforeSource;
-            FaceGenFiles? previousFaceGen = null;
             if (sourcePluginActive)
             {
-                if (sourceIndex <= 0)
-                    throw new InvalidOperationException($"Could not find both {assignment.SourceName} and the earlier version needed to restore it before {assignment.SourcePlugin}.");
+                if (sourceIndex < 0)
+                    throw new InvalidOperationException($"Could not find {assignment.SourceName} in active plugin {assignment.SourcePlugin}.");
                 var laterOverride = sourceChain.Skip(sourceIndex + 1).FirstOrDefault(r => !IsGalathilOutputPlugin(r.Plugin));
                 if (laterOverride is not null)
                     throw new InvalidOperationException($"{assignment.SourceName} is overwritten by '{laterOverride.Plugin}' after '{assignment.SourcePlugin}'. Select the active winning replacer.");
                 source = sourceChain[sourceIndex].Record;
-                beforeSource = sourceChain[sourceIndex - 1].Record;
-                previousFaceGen = assetResolver.ReadEarlierFaceGen(assignment.SourceMod, sourceChain[sourceIndex - 1].Plugin, source.FormKey);
+                beforeSource = sourceChain.Take(sourceIndex).LastOrDefault(r => !IsGalathilOutputPlugin(r.Plugin))?.Record ?? source;
             }
             else
             {
-                using var sourcePluginMod = SkyrimMod.CreateFromBinaryOverlay(sourcePluginPath, SkyrimRelease.SkyrimSE);
-                source = sourcePluginMod.Npcs.FirstOrDefault(n => FormKeyText(n.FormKey).Equals(NormalizeFormKey(assignment.SourceFormKey), StringComparison.OrdinalIgnoreCase))?.DeepCopy()
+                using var sourcePluginLease = PluginFileAccess.Open(assignment.SourcePlugin, sourcePluginPath);
+                var sourcePluginMod = sourcePluginLease.Mod;
+                source = sourcePluginMod.Npcs.FirstOrDefault(n => FormKeyText(n.FormKey).Equals(normalizedSourceKey, StringComparison.OrdinalIgnoreCase))?.DeepCopy()
                     ?? throw new InvalidOperationException($"{assignment.SourceName} is not present in {assignment.SourcePlugin}.");
-                beforeSource = sourceChain[^1].Record;
+                beforeSource = IsAddedNpcFormKey(assignment.SourceFormKey, assignment.SourcePlugin)
+                    ? source
+                    : sourceChain.LastOrDefault(r => !IsGalathilOutputPlugin(r.Plugin))?.Record
+                        ?? throw new InvalidOperationException($"Could not find the earlier active NPC record needed for {assignment.SourceName}.");
             }
-            var targetChain = GetChain(npcChains, NormalizeFormKey(assignment.TargetFormKey), assignment.TargetName);
-            var target = targetChain[^1].Record;
+            var normalizedTargetKey = NormalizeFormKey(assignment.TargetFormKey);
+            var targetChain = GetChain(npcChains, normalizedTargetKey, assignment.TargetName);
+            // An incoming look must start from the recipient's own record, even when
+            // its old replacer is donating a look elsewhere in this batch.
+            var target = sourceKeys.Contains(normalizedTargetKey)
+                ? targetChain.LastOrDefault(r => !IsGalathilOutputPlugin(r.Plugin) &&
+                    !sourcePlugins.Contains(r.Plugin, StringComparer.OrdinalIgnoreCase))?.Record
+                    ?? throw new InvalidOperationException($"{assignment.TargetName} needs a recipient record outside the source plugins being replaced.")
+                : targetChain[^1].Record;
             var appearance = source;
             if (!string.IsNullOrWhiteSpace(assignment.AppearanceFormKey))
             {
                 var appearancePlugin = assignment.AppearancePlugin ?? assignment.SourcePlugin;
-                if (!pluginPaths.TryGetValue(appearancePlugin, out var appearancePath))
+                if (!sourcePluginReadPaths.TryGetValue(appearancePlugin, out var appearancePath))
                     throw new InvalidOperationException($"The saved appearance for {assignment.SourceName} refers to missing plugin {appearancePlugin}.");
-                using var appearancePluginMod = SkyrimMod.CreateFromBinaryOverlay(appearancePath, SkyrimRelease.SkyrimSE);
+                using var appearancePluginLease = PluginFileAccess.Open(appearancePlugin, appearancePath);
+                var appearancePluginMod = appearancePluginLease.Mod;
                 appearance = appearancePluginMod.Npcs.FirstOrDefault(n => FormKeyText(n.FormKey).Equals(NormalizeFormKey(assignment.AppearanceFormKey), StringComparison.OrdinalIgnoreCase))?.DeepCopy()
                     ?? throw new InvalidOperationException($"The saved appearance for {assignment.SourceName} is not present in {appearancePlugin}. Restore the source mod's Galathil backup first.");
             }
@@ -509,23 +568,18 @@ internal static class NpcAppearanceGenerator
             var hasNewOutfit = assignment.HasNewOutfit || (appearance.DefaultOutfit is { IsNull: false } &&
                 appearance.DefaultOutfit.FormKeyNullable != beforeSource.DefaultOutfit?.FormKeyNullable);
             var appearanceMod = assignment.AppearanceMod ?? assignment.SourceMod;
-            var sourceFaceGen = assetResolver.ReadCurrentReplacerFaceGen(appearanceMod, appearance.FormKey, warnings);
-            if (sourcePluginActive && previousFaceGen is not null && string.IsNullOrWhiteSpace(assignment.AppearanceFormKey) &&
-                AppearanceSignature(source, includeSkin: true, includeOutfit: true).Equals(
-                    AppearanceSignature(beforeSource, includeSkin: true, includeOutfit: true), StringComparison.Ordinal) &&
-                sourceFaceGen.Mesh.AsSpan().SequenceEqual(previousFaceGen.Mesh) && sourceFaceGen.Tint.AsSpan().SequenceEqual(previousFaceGen.Tint))
-                throw new InvalidOperationException($"{assignment.SourceName} has already been restored by an older Galathil transfer. Select its existing Galathil mapping or restore the matching backup first.");
-            if (!string.IsNullOrWhiteSpace(assignment.AppearanceFormKey) &&
-                previousFaceGen is not null &&
-                AppearanceSignature(appearance, includeSkin: true, includeOutfit: true).Equals(
-                    AppearanceSignature(beforeSource, includeSkin: true, includeOutfit: true), StringComparison.Ordinal) &&
-                sourceFaceGen.Mesh.AsSpan().SequenceEqual(previousFaceGen.Mesh) && sourceFaceGen.Tint.AsSpan().SequenceEqual(previousFaceGen.Tint))
-                throw new InvalidOperationException($"The saved Galathil appearance for {assignment.SourceName} matches its earlier appearance. Restore its source mod backup before importing it.");
+            var previousTarget = previousManifest?.Assignments.FirstOrDefault(previous =>
+                previous.SourcePlugin.Equals(assignment.SourcePlugin, StringComparison.OrdinalIgnoreCase) &&
+                NormalizeFormKey(previous.SourceFormKey).Equals(NormalizeFormKey(assignment.SourceFormKey), StringComparison.OrdinalIgnoreCase));
+            var previousFaceGenTarget = previousTarget is null
+                ? (FormKey?)null
+                : ParseOutfitFormKey(previousTarget.TargetFormKey, previousTarget.TargetName);
+            var sourceFaceGen = assetResolver.ReadSharedOutputFaceGen(appearanceMod, appearance.FormKey, previousFaceGenTarget, previousFaceGen, warnings);
 
             if (!IsFemale(appearance).Equals(IsFemale(target)))
-                warnings.Add($"SkyPatcher will change {assignment.TargetName}'s sex to match {assignment.SourceName}; check voice, animations, and behavior in game.");
+                warnings.Add($"Galathil will change {assignment.TargetName}'s sex to match {assignment.SourceName}; check voice, animations, and behavior in game.");
             if (appearance.Race.FormKey != target.Race.FormKey)
-                warnings.Add($"SkyPatcher will change {assignment.TargetName}'s race to match {assignment.SourceName}; this can affect race-based behavior.");
+                warnings.Add($"Galathil will change {assignment.TargetName}'s race to match {assignment.SourceName}; this can affect race-based behavior.");
             if (!copiedSkin && (assignment.HasCustomSkin || assignment.HasCustomBody))
                 warnings.Add($"{assignment.TargetName} keeps its current skin/body. Select Skin or Body to transfer the replacer's unique assets.");
             if (assignment.HasCustomSkin && assignment.HasCustomBody && copySkin != copyBody)
@@ -533,25 +587,33 @@ internal static class NpcAppearanceGenerator
             if (hasNewOutfit && !replaceOutfit && !outfitAssignments.Any(o => NormalizeFormKey(o.TargetFormKey).Equals(NormalizeFormKey(assignment.TargetFormKey), StringComparison.OrdinalIgnoreCase)))
                 warnings.Add($"{assignment.TargetName} keeps its current outfit because Replace Outfit was not selected.");
 
+            var copyRace = changeTargetRace && appearance.Race.FormKey != target.Race.FormKey;
+            var copyGender = changeTargetRace && !IsFemale(appearance).Equals(IsFemale(target));
             prepared.Add(new SharedPreparedAssignment(assignment, source, appearance, beforeSource, target,
-                sourceFaceGen, previousFaceGen, sourcePluginActive, copiedSkin, replaceOutfit && hasNewOutfit));
+                sourceFaceGen, copyRace, copyGender, copiedSkin, replaceOutfit && hasNewOutfit));
         }
 
         var stageFolder = Path.Combine(modsPath, ".galathil-output-stage-" + Guid.NewGuid().ToString("N"));
         if (!IsChildPath(modsPath, stageFolder)) throw new InvalidOperationException("Could not create Galathil Output staging folder inside the MO2 mods directory.");
         Directory.CreateDirectory(stageFolder);
         var pluginNames = new List<string>();
-        var expectedFaceGen = new Dictionary<FormKey, FaceGenFiles>();
+        var transferredFaceGen = new List<(SharedPreparedAssignment Item, FaceGenFiles Files)>();
         var outputMasters = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         try
         {
             var shardCapacity = (int)(LastLightObjectId - FirstLightObjectId + 1);
-            using var appearanceRecordLibrary = new AppearanceRecordLibrary(sourcePlugins, pluginPaths);
+            var recordSourcePlugins = sourcePlugins
+                .Concat(assignments.Select(a => a.AppearancePlugin).Where(name => !string.IsNullOrWhiteSpace(name)).Select(name => name!))
+                .Concat(outfitAssignments.Select(o => o.OutfitPlugin))
+                .Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
+            using var appearanceRecordLibrary = new AppearanceRecordLibrary(recordSourcePlugins, sourcePluginReadPaths);
             var copyableRecordsByAssignment = prepared.ToDictionary(item => item,
                 item => appearanceRecordLibrary.GetCopyableClosure(AppearanceRecordRoots(item, outfitAssignments,
-                    sourcePlugins.ToHashSet(StringComparer.OrdinalIgnoreCase))));
+                    recordSourcePlugins.ToHashSet(StringComparer.OrdinalIgnoreCase))));
             var shardAssignmentsList = BuildSharedOutputShards(prepared, copyableRecordsByAssignment, shardCapacity);
-            var cloneRules = new List<(SharedPreparedAssignment Item, FormKey CloneKey, string PluginName, IReadOnlyDictionary<FormKey, FormKey> CopiedRecords)>();
+            var outputRules = new List<SharedOutputRule>();
+            var copiedOutfitKeys = new HashSet<FormKey>();
+            var outfitAssetMarkerLinks = new List<(string ModName, string PluginName)>();
             for (var shardIndex = 0; shardIndex < shardAssignmentsList.Count; shardIndex++)
             {
                 var shard = shardIndex + 1;
@@ -561,40 +623,49 @@ internal static class NpcAppearanceGenerator
                 output.ModHeader.Flags |= SkyrimModHeader.HeaderFlag.Small;
                 var shardAssignments = shardAssignmentsList[shardIndex].ToArray();
                 uint localId = FirstLightObjectId;
-                var npcClones = new List<(SharedPreparedAssignment Item, Npc Clone)>();
+                var npcOverrides = new List<(SharedPreparedAssignment Item, Npc Override)>();
                 foreach (var item in shardAssignments)
                 {
-                    if (item.RestoreSource && !NormalizeFormKey(item.Assignment.SourceFormKey).Equals(NormalizeFormKey(item.Assignment.TargetFormKey), StringComparison.OrdinalIgnoreCase))
-                    {
-                        if (item.PreviousFaceGen is null) throw new InvalidDataException($"Earlier FaceGen for {item.Assignment.SourceName} was not available to restore the source NPC.");
-                        var restore = output.Npcs.GetOrAddAsOverride(item.BeforeSource);
-                        CopyAppearance(restore, item.BeforeSource, includeRace: false, includeSkin: true, includeOutfit: true);
-                        WriteFaceGen(stageFolder, item.Source.FormKey, item.PreviousFaceGen);
-                        expectedFaceGen[item.Source.FormKey] = item.PreviousFaceGen;
-                    }
-
-                    var cloneKey = new FormKey(output.ModKey, localId++);
-                    var clone = output.Npcs.AddNew(cloneKey);
-                    CopyAppearance(clone, item.Appearance, includeRace: false, includeSkin: false, includeOutfit: false);
-                    clone.Race = item.Appearance.Race.FormKey.ToLink<IRaceGetter>();
-                    clone.Configuration.Flags = item.Appearance.Configuration.Flags;
-                    clone.EditorID = MakeEditorId(item.Appearance, clone.FormKey);
-                    WriteFaceGen(stageFolder, item.Target.FormKey, item.SourceFaceGen);
-                    expectedFaceGen[item.Target.FormKey] = item.SourceFaceGen;
-                    npcClones.Add((item, clone));
+                    // Galathil Output only owns recipient records. Let the donor resolve through
+                    // the normal plugin chain instead of pinning an earlier record in this output.
+                    var targetOverride = output.Npcs.GetOrAddAsOverride(item.Target);
+                    var targetFaceGen = RekeyFaceGen(item.SourceFaceGen, item.Source.FormKey, item.Appearance.FormKey, item.Target.FormKey);
+                    transferredFaceGen.Add((item, targetFaceGen));
+                    npcOverrides.Add((item, targetOverride));
                 }
 
                 var shardCopyableRecords = shardAssignments.SelectMany<SharedPreparedAssignment, FormKey>(item => (IEnumerable<FormKey>)copyableRecordsByAssignment[item])
                     .Distinct().OrderBy(key => key.ModKey.FileName.ToString(), StringComparer.OrdinalIgnoreCase)
                     .ThenBy(key => key.ID).ToArray();
                 var copiedRecords = appearanceRecordLibrary.CopyToOutput(shardCopyableRecords, output, ref localId);
-                foreach (var (item, clone) in npcClones)
+                foreach (var (item, npcOverride) in npcOverrides)
                 {
-                    clone.RemapLinks(copiedRecords);
-                    cloneRules.Add((item, clone.FormKey, pluginName, copiedRecords));
+                    var appearanceOutfit = item.Appearance.DeepCopy();
+                    appearanceOutfit.RemapLinks(copiedRecords);
+                    CopyAppearance(npcOverride, appearanceOutfit, item.CopyRace, item.CopySkinArmor, includeOutfit: false);
+                    if (item.CopyGender)
+                        npcOverride.Configuration.Flags = (npcOverride.Configuration.Flags & ~NpcConfiguration.Flag.Female) |
+                            (appearanceOutfit.Configuration.Flags & NpcConfiguration.Flag.Female);
+
+                    var selectedOutfit = outfitAssignments.FirstOrDefault(o =>
+                        NormalizeFormKey(o.TargetFormKey).Equals(NormalizeFormKey(item.Assignment.TargetFormKey), StringComparison.OrdinalIgnoreCase));
+                    var transferOutfit = selectedOutfit is not null
+                        ? RemapCopiedFormKey(ParseOutfitFormKey(selectedOutfit.OutfitFormKey, selectedOutfit.OutfitName), copiedRecords)
+                        : item.CopyOutfit ? appearanceOutfit.DefaultOutfit?.FormKeyNullable : null;
+                    if (selectedOutfit is not null || item.CopyOutfit)
+                        npcOverride.DefaultOutfit = new FormLinkNullable<IOutfitGetter>(transferOutfit);
+
+                    outputRules.Add(new SharedOutputRule(item, pluginName, copiedRecords));
+                    foreach (var outfit in outfitAssignments.Where(o =>
+                                 NormalizeFormKey(o.TargetFormKey).Equals(NormalizeFormKey(item.Assignment.TargetFormKey), StringComparison.OrdinalIgnoreCase)))
+                    {
+                        var outfitKey = ParseOutfitFormKey(outfit.OutfitFormKey, outfit.OutfitName);
+                        if (copiedRecords.ContainsKey(outfitKey)) copiedOutfitKeys.Add(outfitKey);
+                        outfitAssetMarkerLinks.Add((outfit.OutfitModName, pluginName));
+                    }
                 }
 
-                ValidateLightPlugin(output, shardAssignments.Select((_, i) => new FormKey(output.ModKey, FirstLightObjectId + (uint)i)).ToHashSet());
+                ValidateLightPlugin(output, new HashSet<FormKey>());
                 var pluginPath = Path.Combine(stageFolder, pluginName);
                 output.BeginWrite.ToPath(new ModPath(output.ModKey, pluginPath))
                     .WithNoLoadOrder()
@@ -621,64 +692,94 @@ internal static class NpcAppearanceGenerator
                 if (check.Npcs.Any(n => n.IsDeleted || (n.FormKey.ModKey == output.ModKey &&
                     (n.FormKey.ID < FirstLightObjectId || n.FormKey.ID > LastLightObjectId))))
                     throw new InvalidDataException($"{pluginName} has deleted NPCs or local IDs outside the extended ESL range.");
-                ValidateWrittenFaceGen(stageFolder, expectedFaceGen);
             }
 
-            if (prepared.Count > 0 || outfitAssignments.Count > 0)
+            var lookTargetKeys = prepared.Select(item => NormalizeFormKey(item.Assignment.TargetFormKey))
+                .ToHashSet(StringComparer.OrdinalIgnoreCase);
+            var outfitOnlyAssignments = outfitAssignments
+                .Where(outfit => !lookTargetKeys.Contains(NormalizeFormKey(outfit.TargetFormKey))).ToArray();
+            if (outfitOnlyAssignments.Length > 0)
             {
-                var configFolder = Path.Combine(stageFolder, "SKSE", "Plugins", "SkyPatcher", "npc");
-                Directory.CreateDirectory(configFolder);
-                var lines = new List<string>
+                var outfitRecords = outfitOnlyAssignments.ToDictionary(outfit => outfit,
+                    outfit => appearanceRecordLibrary.GetCopyableClosure([
+                        ParseOutfitFormKey(outfit.OutfitFormKey, outfit.OutfitName)]));
+                var outfitChunks = new List<List<OutfitAssignment>>();
+                var currentOutfits = new List<OutfitAssignment>();
+                var currentRecords = new HashSet<FormKey>();
+                foreach (var outfit in outfitOnlyAssignments)
                 {
-                    "; Generated by Galathil. The shared appearance records are in the Galathil Output ESPFE plugin(s).",
-                    "; Loose meshes and textures remain in their enabled MO2 asset mods."
-                };
-                foreach (var (item, cloneKey, pluginName, copiedRecords) in cloneRules)
-                {
-                    var targetIdentifier = FormKeyIdentifier(item.Target.FormKey);
-                    var cloneIdentifier = FormKeyIdentifier(cloneKey);
-                    var rule = new List<string>
+                    var outfitKeys = outfitRecords[outfit];
+                    var added = outfitKeys.Count(key => !currentRecords.Contains(key));
+                    if (currentOutfits.Count > 0 && currentRecords.Count + added > shardCapacity)
                     {
-                        "filterByNpcs=" + targetIdentifier,
-                        "filterByTemplate=" + targetIdentifier,
-                        "restrictToTemplateFlags=traits",
-                        "copyVisualStyle=" + cloneIdentifier
-                    };
-                    if (!IsFemale(item.Appearance).Equals(IsFemale(item.Target)))
-                        rule.Add((IsFemale(item.Appearance) ? "setFlags=female" : "removeFlags=female"));
-                    if (item.Appearance.Race.FormKey != item.Target.Race.FormKey)
-                        rule.Add("race=" + FormKeyIdentifier(RemapCopiedFormKey(item.Appearance.Race.FormKey, copiedRecords)));
-                    var selectedOutfit = outfitAssignments.FirstOrDefault(o =>
-                        NormalizeFormKey(o.TargetFormKey).Equals(NormalizeFormKey(item.Assignment.TargetFormKey), StringComparison.OrdinalIgnoreCase));
-                    var transferOutfit = selectedOutfit is not null
-                        ? ParseOutfitFormKey(selectedOutfit.OutfitFormKey, selectedOutfit.OutfitName)
-                        : item.CopyOutfit ? item.Appearance.DefaultOutfit?.FormKeyNullable : null;
-                    if (transferOutfit.HasValue)
-                        rule.Add("outfitDefault=" + FormKeyIdentifier(RemapCopiedFormKey(transferOutfit.Value, copiedRecords)));
-                    lines.Add(string.Join(':', rule));
-                    if (item.CopySkinArmor && item.Appearance.WornArmor is { IsNull: false } skin)
-                        lines.Add("filterByNpcs=" + targetIdentifier + ":skin=" + FormKeyIdentifier(RemapCopiedFormKey(skin.FormKey, copiedRecords)));
-                    else if (item.Target.WornArmor is { IsNull: false } targetSkin)
-                        lines.Add("filterByNpcs=" + targetIdentifier + ":skin=" + FormKeyIdentifier(targetSkin.FormKey));
+                        outfitChunks.Add(currentOutfits);
+                        currentOutfits = [];
+                        currentRecords = [];
+                        added = outfitKeys.Count;
+                    }
+                    if (outfitKeys.Count > shardCapacity)
+                        throw new InvalidOperationException($"{outfit.OutfitName} needs more linked records than one ESL output can hold.");
+                    currentOutfits.Add(outfit);
+                    currentRecords.UnionWith(outfitKeys);
                 }
-                var appearanceTargets = cloneRules.Select(rule => NormalizeFormKey(rule.Item.Assignment.TargetFormKey))
-                    .ToHashSet(StringComparer.OrdinalIgnoreCase);
-                foreach (var outfitAssignment in outfitAssignments.Where(o => !appearanceTargets.Contains(NormalizeFormKey(o.TargetFormKey))))
+                if (currentOutfits.Count > 0) outfitChunks.Add(currentOutfits);
+
+                foreach (var outfitChunk in outfitChunks)
                 {
-                    var targetIdentifier = NormalizeIdentifier(outfitAssignment.TargetFormKey);
-                    var outfitIdentifier = NormalizeIdentifier(outfitAssignment.OutfitFormKey);
-                    lines.Add("filterByNpcs=" + targetIdentifier + ":outfitDefault=" + outfitIdentifier);
+                    var pluginName = OutputPluginName(pluginNames.Count + 1);
+                    pluginNames.Add(pluginName);
+                    var output = new SkyrimMod(ModKey.FromFileName(pluginName), SkyrimRelease.SkyrimSE);
+                    output.ModHeader.Flags |= SkyrimModHeader.HeaderFlag.Small;
+                    uint localId = FirstLightObjectId;
+                    var chunkKeys = outfitChunk.SelectMany(outfit => outfitRecords[outfit]).Distinct()
+                        .OrderBy(key => key.ModKey.FileName.ToString(), StringComparer.OrdinalIgnoreCase)
+                        .ThenBy(key => key.ID).ToArray();
+                    var copiedRecords = appearanceRecordLibrary.CopyToOutput(chunkKeys, output, ref localId);
+                    foreach (var outfit in outfitChunk)
+                    {
+                        var target = GetChain(npcChains, NormalizeFormKey(outfit.TargetFormKey), outfit.TargetName)[^1].Record;
+                        var targetOverride = output.Npcs.GetOrAddAsOverride(target);
+                        var outfitKey = ParseOutfitFormKey(outfit.OutfitFormKey, outfit.OutfitName);
+                        targetOverride.DefaultOutfit = new FormLinkNullable<IOutfitGetter>(RemapCopiedFormKey(outfitKey, copiedRecords));
+                        if (copiedRecords.ContainsKey(outfitKey)) copiedOutfitKeys.Add(outfitKey);
+                        outfitAssetMarkerLinks.Add((outfit.OutfitModName, pluginName));
+                    }
+
+                    ValidateLightPlugin(output, new HashSet<FormKey>());
+                    var pluginPath = Path.Combine(stageFolder, pluginName);
+                    output.BeginWrite.ToPath(new ModPath(output.ModKey, pluginPath))
+                        .WithNoLoadOrder()
+                        .WithMastersListContent(MastersListContentOption.Iterate)
+                        .WithMastersListOrdering(outputMasterOrder.Select(name => ModKey.FromFileName(name)))
+                        .Write();
+                    using var check = SkyrimMod.CreateFromBinaryOverlay(pluginPath, SkyrimRelease.SkyrimSE);
+                    var unresolvedMasters = check.ModHeader.MasterReferences.Select(master => master.Master.FileName.ToString())
+                        .Where(name => !allowedOutputMasters.Contains(name)).ToArray();
+                    if (unresolvedMasters.Length > 0)
+                        throw new InvalidDataException($"{pluginName} requires inactive or missing masters: {string.Join(", ", unresolvedMasters)}.");
+                    var currentMasters = check.ModHeader.MasterReferences.Select(master => master.Master.FileName.ToString()).ToArray();
+                    var masterIndexes = currentMasters.Select(name => outputMasterOrder.IndexOf(name)).ToArray();
+                    if (masterIndexes.Any(index => index < 0) || !masterIndexes.SequenceEqual(masterIndexes.OrderBy(index => index)))
+                        throw new InvalidDataException($"{pluginName} has missing or incorrectly ordered masters for the selected profile.");
+                    foreach (var master in currentMasters) outputMasters.Add(master);
+                    if (!check.ModHeader.Flags.HasFlag(SkyrimModHeader.HeaderFlag.Small))
+                        throw new InvalidDataException($"{pluginName} was not saved as an ESPFE plugin.");
                 }
-                File.WriteAllText(Path.Combine(configFolder, "Galathil_Output.ini"), string.Join(Environment.NewLine, lines) + Environment.NewLine, new UTF8Encoding(false));
             }
+
+            // The library caches source plugin readers. Close them before install hides source ESPs.
+            appearanceRecordLibrary.Dispose();
 
             var assetLinks = assignments.Select(a => new GalathilAssetLink(a.SourceMod, a.SourcePlugin))
+                .Concat(outfitAssignments.Select(o => new GalathilAssetLink(o.OutfitModName, o.OutfitPlugin)))
                 .DistinctBy(link => AssetLinkKey(link.SourceMod, link.SourcePlugin), StringComparer.OrdinalIgnoreCase).ToArray();
             var oldConfigPaths = FindMigratedLegacyConfigs(modsPath, assetLinks, assignments, warnings);
             var legacyConfigBlocks = FindUnmigratedLegacyConfigPlugins(modsPath, assetLinks, assignments);
             var disabledSourcePlugins = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             foreach (var sourcePlugin in sourcePlugins)
             {
+                var hasAddedNpcDonor = assignments.Any(a => a.SourcePlugin.Equals(sourcePlugin, StringComparison.OrdinalIgnoreCase) &&
+                    IsAddedNpcFormKey(a.SourceFormKey, a.SourcePlugin));
                 var dependent = FindActivePluginDependent(sourcePlugin, activePlugins, pluginPaths, pluginNames);
                 var requiredByOutput = outputMasters.Contains(sourcePlugin);
                 var requiredByOutfit = outfitAssignments.Any(o =>
@@ -686,9 +787,7 @@ internal static class NpcAppearanceGenerator
                     if (!o.OutfitPlugin.Equals(sourcePlugin, StringComparison.OrdinalIgnoreCase) &&
                         !o.OutfitWinningPlugin.Equals(sourcePlugin, StringComparison.OrdinalIgnoreCase)) return false;
                     var outfitKey = ParseOutfitFormKey(o.OutfitFormKey, o.OutfitName);
-                    return !cloneRules.Any(rule =>
-                        NormalizeFormKey(rule.Item.Assignment.TargetFormKey).Equals(NormalizeFormKey(o.TargetFormKey), StringComparison.OrdinalIgnoreCase) &&
-                        rule.CopiedRecords.ContainsKey(outfitKey));
+                    return !copiedOutfitKeys.Contains(outfitKey);
                 });
                 var hasUnmigratedConfig = legacyConfigBlocks.Contains(sourcePlugin);
                 if (!activePlugins.Contains(sourcePlugin))
@@ -698,7 +797,11 @@ internal static class NpcAppearanceGenerator
                         if (!requiredByOutput && !requiredByOutfit && dependent is null && !hasUnmigratedConfig)
                             disabledSourcePlugins.Add(sourcePlugin);
                         else
+                        {
+                            if (hasAddedNpcDonor)
+                                throw new InvalidOperationException($"Galathil cannot use this added follower NPC without disabling {sourcePlugin}, but {(requiredByOutput ? "Galathil Output needs it as a master" : requiredByOutfit ? "the selected outfit still uses one of its records" : dependent is not null ? $"{dependent} requires it" : "its old Galathil config still has routes")}. Resolve that dependency first so the follower does not remain in game.");
                             warnings.Add($"Re-enabled {sourcePlugin} because {(requiredByOutput ? "Galathil Output uses records from it" : requiredByOutfit ? "an outfit assignment uses a record from it" : dependent is not null ? $"{dependent} requires it" : "its old Galathil config still has routes")}. Its asset mod remains enabled.");
+                        }
                     }
                     else if (requiredByOutput || requiredByOutfit || dependent is not null || hasUnmigratedConfig)
                     {
@@ -712,10 +815,17 @@ internal static class NpcAppearanceGenerator
                 else
                 {
                     var reason = requiredByOutput ? "Galathil Output uses records from it" : requiredByOutfit ? "a selected outfit comes from it" : dependent is not null ? $"{dependent} requires it" : "its old Galathil config has routes not yet imported";
+                    if (hasAddedNpcDonor)
+                        throw new InvalidOperationException($"Galathil cannot use this added follower NPC without disabling {sourcePlugin}, but {reason}. Resolve that dependency first so the follower does not remain in game.");
                     warnings.Add($"Kept {sourcePlugin} enabled because {reason}. Its mod still provides the linked assets.");
                 }
             }
-            var restoreSourcePlugins = (previousManifest?.DisabledSourcePlugins ?? Array.Empty<string>())
+            foreach (var sourcePlugin in disabledSourcePlugins.Where(plugin => assignments.Any(assignment =>
+                         assignment.SourcePlugin.Equals(plugin, StringComparison.OrdinalIgnoreCase) &&
+                         IsAddedNpcFormKey(assignment.SourceFormKey, assignment.SourcePlugin))))
+                warnings.Add($"Disabled {sourcePlugin} in this MO2 profile so the donor follower is removed. This also removes its other NPCs, quests, dialogue, and plugin records; its asset mod remains enabled.");
+
+            var restoreSourcePlugins = availablePriorDisabledPlugins
                 .Where(name => !disabledSourcePlugins.Contains(name)).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
             var sourcePluginLoadOrder = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
             if (previousManifest?.SourcePluginLoadOrder is { } savedPluginOrder)
@@ -726,11 +836,21 @@ internal static class NpcAppearanceGenerator
                 var position = activePluginOrder.IndexOf(sourcePlugin);
                 if (position >= 0) sourcePluginLoadOrder[sourcePlugin] = position;
             }
-            var assetMarkerFiles = BuildAssetMarkerFiles(pluginNames, cloneRules);
+            var plannedFaceGen = PlanTransferredFaceGen(modsPath, transferredFaceGen, previousFaceGen, warnings);
+            foreach (var item in prepared)
+                assetResolver.EnsureRecipientFaceGenWillWin(item.Assignment.AppearanceMod ?? item.Assignment.SourceMod,
+                    item.Target.FormKey, item.Assignment.TargetName, plannedFaceGen);
+            var assetMarkerFiles = BuildAssetMarkerFiles(pluginNames, outputRules, outfitAssetMarkerLinks);
+            var faceGenLinks = transferredFaceGen.Select(transfer => new GalathilFaceGenLink(
+                transfer.Item.Assignment.AppearanceMod ?? transfer.Item.Assignment.SourceMod,
+                transfer.Item.Assignment.SourcePlugin,
+                FormKeyText(transfer.Item.Target.FormKey),
+                Sha256Hex(transfer.Files.Mesh),
+                Sha256Hex(transfer.Files.Tint))).ToArray();
             var manifest = new GalathilOutputManifest(1, copySkin, copyBody, replaceOutfit, assignments.ToArray(),
-                disabledSourcePlugins.ToArray(), assetLinks, sourcePluginLoadOrder, null, outfitAssignments.ToArray(), assetMarkerFiles);
+                disabledSourcePlugins.ToArray(), assetLinks, sourcePluginLoadOrder, null, outfitAssignments.ToArray(), assetMarkerFiles, faceGenLinks);
             File.WriteAllText(Path.Combine(stageFolder, OutputManifestName), JsonSerializer.Serialize(manifest, new JsonSerializerOptions { WriteIndented = true }), new UTF8Encoding(false));
-            WriteOutputAssetMarkers(stageFolder, pluginNames, cloneRules);
+            WriteOutputAssetMarkers(stageFolder, pluginNames, outputRules);
 
             var backupFolder = Path.Combine(AppContext.BaseDirectory, "Backups", "Galathil Output", DateTime.Now.ToString("yyyyMMdd-HHmmssfff", CultureInfo.InvariantCulture));
             Directory.CreateDirectory(backupFolder);
@@ -739,25 +859,33 @@ internal static class NpcAppearanceGenerator
             else File.WriteAllText(backupPath + ".txt", "No prior Galathil Output mod existed.");
 
             var markerChanges = UpdateAssetModMarkers(modsPath,
-                previousManifest?.AssetLinks ?? Array.Empty<GalathilAssetLink>(), previousManifest?.AssetMarkerFiles,
+                previousManifest?.AssetLinks ?? Array.Empty<GalathilAssetLink>(), assetLinks, previousManifest?.AssetMarkerFiles,
                 assetMarkerFiles, backupFolder);
             var removedConfigChanges = new List<AssetMarkerChange>();
+            var consumedFaceGenChanges = new List<AssetMarkerChange>();
             try
             {
                 removedConfigChanges = BackupAndRemoveLegacyConfigs(oldConfigPaths, modsPath, backupFolder);
+                consumedFaceGenChanges = ApplyTransferredFaceGenToAssetMods(modsPath, plannedFaceGen, backupFolder);
+                var visibilityPluginNames = disabledSourcePlugins.Concat(restoreSourcePlugins)
+                    .Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
+                var sourcePluginFilePaths = ResolveSourcePluginFilePaths(modsPath, modOrder, visibilityPluginNames,
+                    selectedSourcePluginPaths, pluginPaths, assetLinks, previousManifest?.AssetLinks ?? Array.Empty<GalathilAssetLink>());
+                var profilePluginPaths = new Dictionary<string, string>(pluginPaths, StringComparer.OrdinalIgnoreCase);
+                foreach (var (plugin, path) in sourcePluginFilePaths) profilePluginPaths[plugin] = path;
                 InstallGalathilOutput(stageFolder, outputFolder, profilePath, pluginNames, pluginPaths, modsPath,
-                    disabledSourcePlugins, restoreSourcePlugins, pluginPaths, sourcePluginLoadOrder);
+                    disabledSourcePlugins, restoreSourcePlugins, forgottenSourcePlugins, profilePluginPaths, sourcePluginLoadOrder, sourcePluginFilePaths);
             }
             catch
             {
+                RollbackAssetModMarkers(consumedFaceGenChanges);
                 RollbackAssetModMarkers(removedConfigChanges);
                 RollbackAssetModMarkers(markerChanges);
                 throw;
             }
             var finalPluginPath = pluginNames.Count == 0 ? null : Path.Combine(outputFolder, pluginNames[0]);
-            var finalSkyPath = prepared.Count == 0 && outfitAssignments.Count == 0 ? null : Path.Combine(outputFolder, "SKSE", "Plugins", "SkyPatcher", "npc", "Galathil_Output.ini");
-            return new AppearanceGenerationResult(OutputModName, outputFolder, finalPluginPath, finalSkyPath,
-                Directory.Exists(outputFolder) && File.Exists(backupPath) ? backupPath : backupPath + ".txt", warnings.Distinct(StringComparer.Ordinal).ToArray());
+            return new AppearanceGenerationResult(OutputModName, outputFolder, finalPluginPath, null,
+                backupFolder, warnings.Distinct(StringComparer.Ordinal).ToArray(), assignments.Count, outfitAssignments.Count);
         }
         catch
         {
@@ -769,8 +897,10 @@ internal static class NpcAppearanceGenerator
     private static void InstallGalathilOutput(string stageFolder, string outputFolder, string profilePath,
         IReadOnlyList<string> pluginNames, IReadOnlyDictionary<string, string> pluginPaths, string modsPath,
         IReadOnlySet<string> disableSourcePlugins, IReadOnlyList<string> restoreSourcePlugins,
+        IReadOnlyList<string> forgetSourcePlugins,
         IReadOnlyDictionary<string, string> profilePluginPaths,
-        IReadOnlyDictionary<string, int> sourcePluginLoadOrder)
+        IReadOnlyDictionary<string, int> sourcePluginLoadOrder,
+        IReadOnlyDictionary<string, string> sourcePluginFilePaths)
     {
         foreach (var name in pluginNames)
             if (pluginPaths.TryGetValue(name, out var path) && !Path.GetFullPath(path).StartsWith(outputFolder + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase))
@@ -778,6 +908,7 @@ internal static class NpcAppearanceGenerator
 
         var oldFolder = outputFolder + ".galathil-old-" + Guid.NewGuid().ToString("N");
         var movedOld = false;
+        var pluginFileRenames = new List<PluginFileRename>();
         try
         {
             if (Directory.Exists(outputFolder))
@@ -786,12 +917,18 @@ internal static class NpcAppearanceGenerator
                 movedOld = true;
             }
             Directory.Move(stageFolder, outputFolder);
-            UpdateGalathilOutputProfile(profilePath, pluginNames, disableSourcePlugins, restoreSourcePlugins, profilePluginPaths, sourcePluginLoadOrder);
+            ApplySourcePluginVisibility(disableSourcePlugins, restoreSourcePlugins, sourcePluginFilePaths, pluginFileRenames);
+            UpdateGalathilOutputProfile(profilePath, pluginNames, disableSourcePlugins, restoreSourcePlugins, forgetSourcePlugins, profilePluginPaths, sourcePluginLoadOrder);
         }
-        catch
+        catch (Exception originalError)
         {
+            Exception? visibilityRollbackError = null;
+            try { RollbackPluginFileRenames(pluginFileRenames); }
+            catch (Exception ex) { visibilityRollbackError = ex; }
             if (Directory.Exists(outputFolder) && !Directory.Exists(stageFolder)) Directory.Move(outputFolder, stageFolder);
             if (movedOld && Directory.Exists(oldFolder) && !Directory.Exists(outputFolder)) Directory.Move(oldFolder, outputFolder);
+            if (visibilityRollbackError is not null)
+                throw new AggregateException("Galathil could not finish the output update and could not fully restore the source ESP visibility changes.", originalError, visibilityRollbackError);
             throw;
         }
         if (movedOld)
@@ -800,6 +937,144 @@ internal static class NpcAppearanceGenerator
             catch (IOException) { }
             catch (UnauthorizedAccessException) { }
         }
+    }
+
+    private sealed record PluginFileRename(string FromPath, string ToPath);
+
+    private static Dictionary<string, string> ResolveSourcePluginFilePaths(
+        string modsPath,
+        IReadOnlyList<GalathilModEntry> modOrder,
+        IReadOnlyList<string> plugins,
+        IReadOnlyDictionary<string, string> selectedSourcePluginPaths,
+        IReadOnlyDictionary<string, string> activePluginPaths,
+        IReadOnlyList<GalathilAssetLink> currentAssetLinks,
+        IReadOnlyList<GalathilAssetLink> previousAssetLinks)
+    {
+        var resolved = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        var allLinks = currentAssetLinks.Concat(previousAssetLinks)
+            .Where(link => plugins.Contains(link.SourcePlugin, StringComparer.OrdinalIgnoreCase))
+            .DistinctBy(link => AssetLinkKey(link.SourceMod, link.SourcePlugin), StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+
+        foreach (var plugin in plugins.Distinct(StringComparer.OrdinalIgnoreCase))
+        {
+            if (!PluginFileAccess.IsPluginName(plugin))
+                throw new InvalidDataException($"Cannot hide or restore invalid plugin filename '{plugin}'.");
+
+            if (selectedSourcePluginPaths.TryGetValue(plugin, out var selectedPath) && File.Exists(selectedPath))
+            {
+                EnsurePluginPathIsInModsFolder(modsPath, plugin, selectedPath);
+                resolved[plugin] = Path.GetFullPath(selectedPath);
+                continue;
+            }
+
+            var linkedCandidates = allLinks.Where(link => link.SourcePlugin.Equals(plugin, StringComparison.OrdinalIgnoreCase))
+                .Select(link => Path.GetFullPath(Path.Combine(modsPath, link.SourceMod)))
+                .Where(folder => IsChildPath(modsPath, folder) && Directory.Exists(folder))
+                .Select(folder => PluginFileAccess.FindInModFolder(folder, plugin))
+                .Where(path => path is not null).Select(path => Path.GetFullPath(path!))
+                .Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
+            if (linkedCandidates.Length == 1)
+            {
+                resolved[plugin] = linkedCandidates[0];
+                continue;
+            }
+
+            if (linkedCandidates.Length > 1)
+            {
+                var hiddenCandidates = linkedCandidates.Where(PluginFileAccess.IsHiddenFile).ToArray();
+                if (hiddenCandidates.Length == 1)
+                {
+                    resolved[plugin] = hiddenCandidates[0];
+                    continue;
+                }
+                if (activePluginPaths.TryGetValue(plugin, out var activePath) && linkedCandidates.Contains(Path.GetFullPath(activePath), StringComparer.OrdinalIgnoreCase))
+                {
+                    resolved[plugin] = Path.GetFullPath(activePath);
+                    continue;
+                }
+                throw new InvalidOperationException($"Galathil found more than one copy of {plugin} in its linked asset mods and cannot safely hide or restore the right file.");
+            }
+
+            var installedCandidates = modOrder
+                .Select(mod => Path.GetFullPath(Path.Combine(modsPath, mod.Name)))
+                .Where(folder => IsChildPath(modsPath, folder) && Directory.Exists(folder))
+                .Select(folder => PluginFileAccess.FindInModFolder(folder, plugin))
+                .Where(path => path is not null).Select(path => Path.GetFullPath(path!))
+                .Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
+            if (installedCandidates.Length == 1)
+            {
+                resolved[plugin] = installedCandidates[0];
+                continue;
+            }
+            var uniqueHidden = installedCandidates.Where(PluginFileAccess.IsHiddenFile).ToArray();
+            if (uniqueHidden.Length == 1)
+            {
+                resolved[plugin] = uniqueHidden[0];
+                continue;
+            }
+            if (activePluginPaths.TryGetValue(plugin, out var activeInstalledPath) &&
+                IsChildPath(modsPath, activeInstalledPath) && installedCandidates.Contains(Path.GetFullPath(activeInstalledPath), StringComparer.OrdinalIgnoreCase))
+            {
+                resolved[plugin] = Path.GetFullPath(activeInstalledPath);
+                continue;
+            }
+            throw new FileNotFoundException($"Galathil could not identify a single MO2 mod file for {plugin} to hide or restore.");
+        }
+        return resolved;
+    }
+
+    private static void EnsurePluginPathIsInModsFolder(string modsPath, string plugin, string path)
+    {
+        if (!IsChildPath(modsPath, path) || !PluginFileAccess.TryGetPluginName(path, out var foundName) ||
+            !foundName.Equals(plugin, StringComparison.OrdinalIgnoreCase))
+            throw new InvalidDataException($"Refusing to hide or restore {plugin} outside its MO2 mod folder: {path}");
+    }
+
+    private static void ApplySourcePluginVisibility(
+        IReadOnlySet<string> disablePlugins,
+        IReadOnlyList<string> restorePlugins,
+        IReadOnlyDictionary<string, string> pluginPaths,
+        ICollection<PluginFileRename> appliedRenames)
+    {
+        foreach (var plugin in disablePlugins)
+        {
+            var path = pluginPaths[plugin];
+            if (PluginFileAccess.IsHiddenFile(path)) continue;
+            var hiddenPath = path + PluginFileAccess.HiddenSuffix;
+            if (File.Exists(hiddenPath))
+                throw new IOException($"Cannot hide {plugin}: both the visible and .mohidden files already exist in its MO2 mod.");
+            File.Move(path, hiddenPath);
+            appliedRenames.Add(new PluginFileRename(path, hiddenPath));
+        }
+
+        foreach (var plugin in restorePlugins)
+        {
+            var path = pluginPaths[plugin];
+            if (!PluginFileAccess.IsHiddenFile(path)) continue;
+            var visiblePath = path[..^PluginFileAccess.HiddenSuffix.Length];
+            if (File.Exists(visiblePath))
+                throw new IOException($"Cannot restore {plugin}: both the visible and .mohidden files already exist in its MO2 mod.");
+            File.Move(path, visiblePath);
+            appliedRenames.Add(new PluginFileRename(path, visiblePath));
+        }
+    }
+
+    private static void RollbackPluginFileRenames(IReadOnlyList<PluginFileRename> renames)
+    {
+        var errors = new List<Exception>();
+        foreach (var rename in renames.Reverse())
+        {
+            try
+            {
+                if (!File.Exists(rename.ToPath)) continue;
+                if (File.Exists(rename.FromPath))
+                    throw new IOException($"Cannot restore {rename.FromPath}; another file now occupies that path.");
+                File.Move(rename.ToPath, rename.FromPath);
+            }
+            catch (Exception ex) { errors.Add(ex); }
+        }
+        if (errors.Count > 0) throw new AggregateException("Could not restore all source ESP filenames after a failed Galathil output update.", errors);
     }
 
     private static string AssetLinkKey(string sourceMod, string sourcePlugin) => sourceMod + "|" + sourcePlugin;
@@ -811,17 +1086,25 @@ internal static class NpcAppearanceGenerator
 
     private static Dictionary<string, IReadOnlyList<string>> BuildAssetMarkerFiles(
         IReadOnlyList<string> outputPlugins,
-        IReadOnlyList<(SharedPreparedAssignment Item, FormKey CloneKey, string PluginName, IReadOnlyDictionary<FormKey, FormKey> CopiedRecords)> cloneRules)
+        IReadOnlyList<SharedOutputRule> outputRules,
+        IReadOnlyList<(string ModName, string PluginName)> outfitAssetMarkerLinks)
     {
         var pluginNumbers = outputPlugins.Select((plugin, index) => (plugin, number: index + 1))
             .ToDictionary(pair => pair.plugin, pair => pair.number, StringComparer.OrdinalIgnoreCase);
         var numbersByMod = new Dictionary<string, HashSet<int>>(StringComparer.OrdinalIgnoreCase);
-        foreach (var rule in cloneRules)
+        foreach (var rule in outputRules)
         {
             if (!pluginNumbers.TryGetValue(rule.PluginName, out var number))
                 throw new InvalidDataException($"Could not find the output ESP number for {rule.PluginName}.");
             var sourceMod = rule.Item.Assignment.SourceMod;
             if (!numbersByMod.TryGetValue(sourceMod, out var numbers)) numbersByMod[sourceMod] = numbers = [];
+            numbers.Add(number);
+        }
+        foreach (var link in outfitAssetMarkerLinks)
+        {
+            if (!pluginNumbers.TryGetValue(link.PluginName, out var number))
+                throw new InvalidDataException($"Could not find the output ESP number for {link.PluginName}.");
+            if (!numbersByMod.TryGetValue(link.ModName, out var numbers)) numbersByMod[link.ModName] = numbers = [];
             numbers.Add(number);
         }
         return numbersByMod.ToDictionary(pair => pair.Key,
@@ -830,12 +1113,12 @@ internal static class NpcAppearanceGenerator
     }
 
     private static void WriteOutputAssetMarkers(string stageFolder, IReadOnlyList<string> outputPlugins,
-        IReadOnlyList<(SharedPreparedAssignment Item, FormKey CloneKey, string PluginName, IReadOnlyDictionary<FormKey, FormKey> CopiedRecords)> cloneRules)
+        IReadOnlyList<SharedOutputRule> outputRules)
     {
         for (var index = 0; index < outputPlugins.Count; index++)
         {
             var plugin = outputPlugins[index];
-            var lines = cloneRules.Where(rule => rule.PluginName.Equals(plugin, StringComparison.OrdinalIgnoreCase))
+            var lines = outputRules.Where(rule => rule.PluginName.Equals(plugin, StringComparison.OrdinalIgnoreCase))
                 .Select(rule => $"{rule.Item.Assignment.SourceName} -> {rule.Item.Assignment.TargetName}")
                 .ToArray();
             var text = lines.Length == 0 ? "" : string.Join(Environment.NewLine, lines) + Environment.NewLine;
@@ -845,6 +1128,7 @@ internal static class NpcAppearanceGenerator
 
     private static List<AssetMarkerChange> UpdateAssetModMarkers(string modsPath,
         IReadOnlyList<GalathilAssetLink> previousLinks,
+        IReadOnlyList<GalathilAssetLink> currentLinks,
         IReadOnlyDictionary<string, IReadOnlyList<string>>? previousMarkerFiles,
         IReadOnlyDictionary<string, IReadOnlyList<string>> currentMarkerFiles,
         string backupFolder)
@@ -858,11 +1142,17 @@ internal static class NpcAppearanceGenerator
         {
             foreach (var (modName, markerNames) in previousMarkerFiles)
             foreach (var markerName in markerNames)
-                trackedPrevious.Add(AssetMarkerPath(modsPath, modName, markerName));
+            {
+                var resolvedModName = ResolvePreviousAssetModName(modsPath, modName, previousLinks, currentLinks);
+                if (resolvedModName is not null)
+                    trackedPrevious.Add(AssetMarkerPath(modsPath, resolvedModName, markerName));
+            }
         }
         foreach (var link in previousLinks)
         {
-            var folder = SafeAssetModFolder(modsPath, link.SourceMod);
+            var resolvedModName = ResolvePreviousAssetModName(modsPath, link.SourceMod, previousLinks, currentLinks, link.SourcePlugin);
+            if (resolvedModName is null) continue;
+            var folder = SafeAssetModFolder(modsPath, resolvedModName);
             legacyMarkers.Add(Path.Combine(folder, SourceAssetMarkerName(link)));
         }
         foreach (var (modName, markerNames) in currentMarkerFiles)
@@ -897,6 +1187,32 @@ internal static class NpcAppearanceGenerator
             RollbackAssetModMarkers(changes);
             throw;
         }
+    }
+
+    private static string? ResolvePreviousAssetModName(string modsPath, string previousModName,
+        IReadOnlyList<GalathilAssetLink> previousLinks, IReadOnlyList<GalathilAssetLink> currentLinks,
+        string? sourcePlugin = null)
+    {
+        var previousFolder = Path.GetFullPath(Path.Combine(modsPath, previousModName));
+        if (!IsChildPath(modsPath, previousFolder))
+            throw new InvalidDataException($"Previous asset mod name is outside the MO2 mods folder: {previousModName}");
+        if (Directory.Exists(previousFolder)) return previousModName;
+
+        var pluginNames = previousLinks.Where(link => link.SourceMod.Equals(previousModName, StringComparison.OrdinalIgnoreCase) &&
+                (sourcePlugin is null || link.SourcePlugin.Equals(sourcePlugin, StringComparison.OrdinalIgnoreCase)))
+            .Select(link => link.SourcePlugin).ToHashSet(StringComparer.OrdinalIgnoreCase);
+        if (pluginNames.Count == 0) return null;
+
+        var currentFolders = currentLinks.Where(link => pluginNames.Contains(link.SourcePlugin))
+            .Select(link => link.SourceMod).Distinct(StringComparer.OrdinalIgnoreCase)
+            .Where(name =>
+            {
+                var folder = Path.GetFullPath(Path.Combine(modsPath, name));
+                if (!IsChildPath(modsPath, folder))
+                    throw new InvalidDataException($"Current asset mod name is outside the MO2 mods folder: {name}");
+                return Directory.Exists(folder);
+            }).ToArray();
+        return currentFolders.Length == 1 ? currentFolders[0] : null;
     }
 
     private static string AssetMarkerPath(string modsPath, string modName, string markerName)
@@ -1009,6 +1325,166 @@ internal static class NpcAppearanceGenerator
         }
     }
 
+    private static Dictionary<string, byte[]?> PlanTransferredFaceGen(
+        string modsPath,
+        IReadOnlyList<(SharedPreparedAssignment Item, FaceGenFiles Files)> transfers,
+        IReadOnlyDictionary<string, string> previousFaceGen,
+        ICollection<string> warnings)
+    {
+        var planned = new Dictionary<string, byte[]?>(StringComparer.OrdinalIgnoreCase);
+        foreach (var (item, files) in transfers)
+        {
+            var appearanceModFolder = SafeAssetModFolder(modsPath, item.Assignment.AppearanceMod ?? item.Assignment.SourceMod);
+            var targetKey = item.Target.FormKey;
+            var targetMesh = Path.Combine(appearanceModFolder, FaceGenRelative(MeshFolder, targetKey, ".nif"));
+            var targetTint = Path.Combine(appearanceModFolder, FaceGenRelative(TintFolder, targetKey, ".dds"));
+            AddWrite(targetMesh, files.Mesh);
+            AddWrite(targetTint, files.Tint);
+
+            foreach (var modFolder in new[]
+                     {
+                         appearanceModFolder,
+                         SafeAssetModFolder(modsPath, item.Assignment.SourceMod)
+                     }.Distinct(StringComparer.OrdinalIgnoreCase))
+            {
+                AddDeleteFaceGen(modFolder, item.Source.FormKey);
+                if (item.Appearance.FormKey != item.Source.FormKey &&
+                    StringComparer.OrdinalIgnoreCase.Equals(item.Appearance.FormKey.ModKey.FileName.ToString(), item.Assignment.SourcePlugin) &&
+                    item.Appearance.EditorID?.StartsWith("GALATHIL_", StringComparison.OrdinalIgnoreCase) == true)
+                    AddDeleteFaceGen(modFolder, item.Appearance.FormKey);
+            }
+
+            if (item.SourceFaceGen.SourceIsArchived)
+                warnings.Add($"The selected FaceGen for {item.Assignment.SourceName} came from an archive. Galathil wrote loose recipient-ID files into {item.Assignment.AppearanceMod ?? item.Assignment.SourceMod}; archived files remain unchanged.");
+
+            void AddWrite(string path, byte[] bytes)
+            {
+                var fullPath = Path.GetFullPath(path);
+                if (!IsChildPath(appearanceModFolder, fullPath))
+                    throw new InvalidDataException($"Refusing to write FaceGen outside the selected asset mod: {path}");
+                if (planned.TryGetValue(fullPath, out var existing) && existing is not null && !existing.AsSpan().SequenceEqual(bytes))
+                    throw new InvalidDataException($"Two transferred looks would write different FaceGen files to {fullPath}.");
+                planned[fullPath] = bytes;
+            }
+
+            void AddDeleteFaceGen(string modFolder, FormKey key)
+            {
+                AddDelete(Path.Combine(modFolder, FaceGenRelative(MeshFolder, key, ".nif")));
+                AddDelete(Path.Combine(modFolder, FaceGenRelative(TintFolder, key, ".dds")));
+            }
+
+            void AddDelete(string path)
+            {
+                var fullPath = Path.GetFullPath(path);
+                if (!IsChildPath(modsPath, fullPath))
+                    throw new InvalidDataException($"Refusing to remove FaceGen outside the MO2 mods folder: {path}");
+                // All donors are read before planning, so the incoming look wins
+                // when it reuses a path being vacated by another donor.
+                if (File.Exists(fullPath)) planned.TryAdd(fullPath, null);
+            }
+        }
+
+        foreach (var (path, expectedHash) in previousFaceGen)
+        {
+            if (planned.ContainsKey(path) || !File.Exists(path)) continue;
+            if (HashMatches(File.ReadAllBytes(path), expectedHash)) planned[path] = null;
+            else warnings.Add($"Left previously generated FaceGen at {path} because it no longer matches Galathil's saved copy.");
+        }
+        return planned;
+    }
+
+    private static List<AssetMarkerChange> ApplyTransferredFaceGenToAssetMods(
+        string modsPath, IReadOnlyDictionary<string, byte[]?> planned, string backupFolder)
+    {
+        if (planned.Count == 0) return [];
+        var changes = planned.Select(pair => new AssetMarkerChange(pair.Key,
+            File.Exists(pair.Key) ? File.ReadAllBytes(pair.Key) : null)).ToList();
+        var existingPaths = changes.Where(change => change.OriginalBytes is not null).Select(change => change.Path).ToArray();
+        var createdPaths = changes.Where(change => change.OriginalBytes is null).Select(change => Path.GetRelativePath(modsPath, change.Path)).ToArray();
+        var notes = "Galathil rekeyed these FaceGen files inside the selected replacer asset mod. To undo, restore the files in this ZIP and remove any new files listed below. Reinstalling the source replacer also restores its original files.\r\n\r\nChanged files:\r\n" +
+            string.Join("\r\n", changes.Select(change => Path.GetRelativePath(modsPath, change.Path))) +
+            "\r\n\r\nNew files to remove when undoing:\r\n" + string.Join("\r\n", createdPaths);
+        CreateBackupArchive(Path.Combine(backupFolder, "rekeyed-facegen.zip"), modsPath, existingPaths, notes);
+
+        try
+        {
+            foreach (var (path, bytes) in planned)
+            {
+                if (bytes is null)
+                {
+                    if (File.Exists(path)) File.Delete(path);
+                    continue;
+                }
+                Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+                File.WriteAllBytes(path, bytes);
+                if (!File.ReadAllBytes(path).AsSpan().SequenceEqual(bytes))
+                    throw new InvalidDataException($"Galathil could not verify the recipient FaceGen file {path}.");
+            }
+
+            return changes;
+        }
+        catch
+        {
+            RollbackAssetModMarkers(changes);
+            throw;
+        }
+
+    }
+
+    private static Dictionary<string, string> IndexManagedFaceGenFiles(string modsPath, IReadOnlyList<GalathilModEntry> modOrder,
+        IReadOnlyList<GalathilFaceGenLink>? links, ICollection<string> warnings)
+    {
+        var files = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var link in links ?? Array.Empty<GalathilFaceGenLink>())
+        {
+            var folder = ResolveManagedFaceGenFolder(modsPath, modOrder, link, warnings);
+            if (folder is null) continue;
+            var key = ParseOutfitFormKey(link.TargetFormKey, link.TargetFormKey);
+            files[Path.Combine(folder, FaceGenRelative(MeshFolder, key, ".nif"))] = link.MeshSha256;
+            files[Path.Combine(folder, FaceGenRelative(TintFolder, key, ".dds"))] = link.TintSha256;
+        }
+        return files;
+    }
+
+    private static string? ResolveManagedFaceGenFolder(string modsPath, IReadOnlyList<GalathilModEntry> modOrder,
+        GalathilFaceGenLink link, ICollection<string> warnings)
+    {
+        var folder = Path.GetFullPath(Path.Combine(modsPath, link.AssetMod));
+        if (!IsChildPath(modsPath, folder))
+            throw new InvalidDataException($"Previous FaceGen asset mod is outside the MO2 mods folder: {link.AssetMod}");
+        var key = ParseOutfitFormKey(link.TargetFormKey, link.TargetFormKey);
+        if (Directory.Exists(folder))
+        {
+            var meshPath = Path.Combine(folder, FaceGenRelative(MeshFolder, key, ".nif"));
+            var tintPath = Path.Combine(folder, FaceGenRelative(TintFolder, key, ".dds"));
+            if (File.Exists(meshPath) || File.Exists(tintPath)) return folder;
+        }
+
+        var matches = new List<string>();
+        foreach (var mod in modOrder)
+        {
+            var candidate = Path.GetFullPath(Path.Combine(modsPath, mod.Name));
+            if (!IsChildPath(modsPath, candidate) || !Directory.Exists(candidate)) continue;
+            var meshPath = Path.Combine(candidate, FaceGenRelative(MeshFolder, key, ".nif"));
+            var tintPath = Path.Combine(candidate, FaceGenRelative(TintFolder, key, ".dds"));
+            if (!File.Exists(meshPath) || !File.Exists(tintPath)) continue;
+            if (HashMatches(File.ReadAllBytes(meshPath), link.MeshSha256) && HashMatches(File.ReadAllBytes(tintPath), link.TintSha256))
+                matches.Add(candidate);
+        }
+        if (matches.Count == 1) return matches[0];
+        if (matches.Count > 1)
+            warnings.Add($"Could not safely find the single MO2 mod holding Galathil's old FaceGen for {link.TargetFormKey}; duplicate copies were left untouched.");
+        return null;
+    }
+
+    private static string Sha256Hex(byte[] data) => Convert.ToHexString(SHA256.HashData(data));
+
+    private static bool HashMatches(byte[] data, string expectedHash)
+    {
+        try { return Convert.ToHexString(SHA256.HashData(data)).Equals(expectedHash, StringComparison.OrdinalIgnoreCase); }
+        catch (ArgumentException) { return false; }
+    }
+
     private static string? FindActivePluginDependent(string sourcePlugin, IReadOnlySet<string> activePlugins,
         IReadOnlyDictionary<string, string> pluginPaths, IReadOnlyList<string> generatedPlugins)
     {
@@ -1036,6 +1512,7 @@ internal static class NpcAppearanceGenerator
 
     private static void UpdateGalathilOutputProfile(string profilePath, IReadOnlyList<string> pluginNames,
         IReadOnlySet<string> disableSourcePlugins, IReadOnlyList<string> restoreSourcePlugins,
+        IReadOnlyList<string> forgetSourcePlugins,
         IReadOnlyDictionary<string, string> profilePluginPaths,
         IReadOnlyDictionary<string, int> sourcePluginLoadOrder)
     {
@@ -1068,7 +1545,9 @@ internal static class NpcAppearanceGenerator
             modLines.Add("+" + OutputModName);
             File.WriteAllLines(staged[modListPath], modLines, new UTF8Encoding(false));
 
-            var pluginLines = File.ReadAllLines(pluginsPath).Where(line => !outputPlugins.Contains(line.TrimStart('*').Trim())).ToList();
+            var pluginLines = File.ReadAllLines(pluginsPath).Where(line =>
+                !outputPlugins.Contains(line.TrimStart('*').Trim()) &&
+                !forgetSourcePlugins.Contains(line.TrimStart('*').Trim(), StringComparer.OrdinalIgnoreCase)).ToList();
             foreach (var sourcePlugin in disableSourcePlugins)
             {
                 var existing = pluginLines.FindIndex(line => line.TrimStart('*').Trim().Equals(sourcePlugin, StringComparison.OrdinalIgnoreCase));
@@ -1084,7 +1563,9 @@ internal static class NpcAppearanceGenerator
             pluginLines.AddRange(pluginNames.Select(name => "*" + name));
             File.WriteAllLines(staged[pluginsPath], pluginLines, new UTF8Encoding(false));
 
-            var orderLines = File.ReadAllLines(loadOrderPath).Where(line => !outputPlugins.Contains(line.Trim())).ToList();
+            var orderLines = File.ReadAllLines(loadOrderPath).Where(line =>
+                !outputPlugins.Contains(line.Trim()) &&
+                !forgetSourcePlugins.Contains(line.Trim(), StringComparer.OrdinalIgnoreCase)).ToList();
             orderLines.RemoveAll(line => disableSourcePlugins.Contains(line.Trim()));
             foreach (var sourcePlugin in restoreSourcePlugins)
             {
@@ -1251,14 +1732,14 @@ internal static class NpcAppearanceGenerator
         {
             var itemRecords = copyableRecordsByAssignment[item];
             var addedRecords = itemRecords.Count(key => !currentRecords.Contains(key));
-            if (current.Count > 0 && current.Count + 1 + currentRecords.Count + addedRecords > capacity)
+            if (current.Count > 0 && currentRecords.Count + addedRecords > capacity)
             {
                 shards.Add(current);
                 current = [];
                 currentRecords = [];
                 addedRecords = itemRecords.Count;
             }
-            if (itemRecords.Count + 1 > capacity)
+            if (itemRecords.Count > capacity)
                 throw new InvalidOperationException($"{item.Assignment.SourceName} needs more than {capacity} local records for its appearance and linked records. Remove unused appearance records or keep its ESP enabled.");
             current.Add(item);
             currentRecords.UnionWith(itemRecords);
@@ -1274,7 +1755,7 @@ internal static class NpcAppearanceGenerator
     {
         private readonly HashSet<string> _sourcePlugins;
         private readonly IReadOnlyDictionary<string, string> _pluginPaths;
-        private readonly Dictionary<string, ISkyrimModDisposableGetter> _mods = new(StringComparer.OrdinalIgnoreCase);
+        private readonly Dictionary<string, PluginFileLease> _mods = new(StringComparer.OrdinalIgnoreCase);
         private readonly Dictionary<string, Func<FormKey, IMajorRecordGetter?>> _resolvers = new(StringComparer.OrdinalIgnoreCase);
         private readonly Dictionary<FormKey, IMajorRecordGetter?> _recordCache = [];
 
@@ -1336,9 +1817,9 @@ internal static class NpcAppearanceGenerator
             {
                 if (!_pluginPaths.TryGetValue(plugin, out var path))
                     throw new FileNotFoundException($"Cannot copy appearance records from {plugin}: its plugin file is missing from the active MO2 profile.");
-                var mod = SkyrimMod.CreateFromBinaryOverlay(path, SkyrimRelease.SkyrimSE);
+                var mod = PluginFileAccess.Open(plugin, path);
                 _mods[plugin] = mod;
-                var cache = mod.ToImmutableLinkCache();
+                var cache = mod.Mod.ToImmutableLinkCache();
                 resolve = formKey => cache.TryResolve(formKey, out IMajorRecordGetter? record, ResolveTarget.Winner) ? record : null;
                 _resolvers[plugin] = resolve;
             }
@@ -1433,6 +1914,267 @@ internal static class NpcAppearanceGenerator
         File.WriteAllBytes(tintPath, files.Tint);
     }
 
+    private static FaceGenFiles RekeyFaceGen(FaceGenFiles files, FormKey donorKey, FormKey appearanceKey, FormKey targetKey)
+    {
+        var inputKeys = new HashSet<FormKey> { donorKey, appearanceKey };
+        if (files.PreviousTarget is { } previous) inputKeys.Add(previous);
+        var mesh = RewriteFaceTintReference(files.Mesh, inputKeys, targetKey, files.PreviousTarget != targetKey);
+        return files with { Mesh = mesh };
+    }
+
+    private static byte[] RewriteFaceTintReference(byte[] nif, IReadOnlySet<FormKey> oldKeys, FormKey newKey, bool rewriteAliases)
+    {
+        var oldPaths = oldKeys.Where(key => key != newKey).Select(key => Encoding.ASCII.GetBytes(FaceTintNifPath(key))).ToArray();
+        if (oldPaths.Length == 0 && !rewriteAliases) return nif;
+        var newPath = FaceTintNifPath(newKey);
+        var newBytes = Encoding.ASCII.GetBytes(newPath);
+        var layout = ReadFaceGenNifLayout(nif);
+        var replacements = new List<NifTexturePathReplacement>();
+        foreach (var oldBytes in oldPaths)
+        foreach (var match in FindAsciiMatches(nif, oldBytes))
+        {
+            var owner = -1;
+            for (var blockIndex = 0; blockIndex < layout.Blocks.Count; blockIndex++)
+            {
+                var block = layout.Blocks[blockIndex];
+                if (match >= block.Start + 4 && match + oldBytes.Length <= block.Start + block.Length)
+                {
+                    owner = blockIndex;
+                    break;
+                }
+            }
+            if (owner < 0 || BinaryPrimitives.ReadInt32LittleEndian(nif.AsSpan(match - 4, 4)) != oldBytes.Length)
+                throw new InvalidDataException($"Galathil found a donor tint path in an unsupported part of the FaceGen mesh for {FormKeyText(newKey)}.");
+            replacements.Add(new NifTexturePathReplacement(match - 4, match, oldBytes.Length, newBytes, owner));
+        }
+        if (rewriteAliases)
+        {
+            // Some follower ports ship a FormID DDS beside a mesh whose tint slot
+            // still points to a named FaceTint file or a RaceMenu export path.
+            for (var index = 0; index < layout.Blocks.Count; index++)
+            {
+                var block = layout.Blocks[index];
+                if (block.Type != "BSShaderTextureSet" || block.Length < sizeof(uint)) continue;
+                var position = block.Start;
+                var count = ReadUInt32(nif, ref position);
+                const int faceTintSlot = 6;
+                if (count <= faceTintSlot) continue;
+                var end = block.Start + block.Length;
+                for (var slot = 0; slot <= faceTintSlot; slot++)
+                {
+                    if (end - position < sizeof(int)) throw new InvalidDataException("Invalid FaceGen texture set.");
+                    var length = ReadInt32(nif, ref position);
+                    if (length < 0 || length > end - position) throw new InvalidDataException("Invalid FaceGen texture path length.");
+                    if (slot == faceTintSlot && length > 0 && !replacements.Any(r => r.DataOffset == position))
+                    {
+                        var path = Encoding.ASCII.GetString(nif, position, length).Replace('/', '\\');
+                        if (!path.Equals(newPath, StringComparison.OrdinalIgnoreCase) &&
+                            path.EndsWith(".dds", StringComparison.OrdinalIgnoreCase) &&
+                            (path.Contains(@"\FaceGenData\FaceTint\", StringComparison.OrdinalIgnoreCase) ||
+                             path.Contains(@"SKSE\Plugins\CharGen\", StringComparison.OrdinalIgnoreCase)))
+                            replacements.Add(new NifTexturePathReplacement(position - sizeof(int), position, length, newBytes, index));
+                    }
+                    position += length;
+                }
+            }
+        }
+        if (replacements.Count == 0) return nif;
+
+        using var output = new MemoryStream(nif.Length + replacements.Sum(replacement => replacement.NewBytes.Length - replacement.OldLength));
+        var cursor = 0;
+        var blockDeltas = new int[layout.Blocks.Count];
+        foreach (var replacement in replacements.OrderBy(item => item.LengthOffset))
+        {
+            if (replacement.LengthOffset < cursor)
+                throw new InvalidDataException("Galathil found overlapping tint-path entries in a FaceGen mesh.");
+            output.Write(nif, cursor, replacement.LengthOffset - cursor);
+            WriteInt32(output, replacement.NewBytes.Length);
+            output.Write(replacement.NewBytes);
+            cursor = replacement.DataOffset + replacement.OldLength;
+            blockDeltas[replacement.BlockIndex] += replacement.NewBytes.Length - replacement.OldLength;
+        }
+        output.Write(nif, cursor, nif.Length - cursor);
+        var rewritten = output.ToArray();
+        for (var index = 0; index < blockDeltas.Length; index++)
+        {
+            if (blockDeltas[index] == 0) continue;
+            var newSize = checked(layout.Blocks[index].Length + blockDeltas[index]);
+            BinaryPrimitives.WriteInt32LittleEndian(rewritten.AsSpan(layout.BlockSizeOffsets[index], 4), newSize);
+        }
+
+        var expectedNewMatches = FindAsciiMatches(nif, newBytes).Count + replacements.Count;
+        var newMatches = FindAsciiMatches(rewritten, newBytes);
+        if (newMatches.Count != expectedNewMatches || oldPaths.Any(path => FindAsciiMatches(rewritten, path).Count != 0))
+            throw new InvalidDataException($"Galathil could not fully update the FaceTint path for {FormKeyText(newKey)}.");
+        return rewritten;
+
+        static void WriteInt32(Stream stream, int value)
+        {
+            Span<byte> bytes = stackalloc byte[4];
+            BinaryPrimitives.WriteInt32LittleEndian(bytes, value);
+            stream.Write(bytes);
+        }
+    }
+
+    private static string FaceTintNifPath(FormKey key) =>
+        $"Textures\\Actors\\Character\\FaceGenData\\FaceTint\\{key.ModKey.FileName}\\{key.ID:X8}.dds";
+
+    private static List<int> FindAsciiMatches(byte[] data, byte[] pattern)
+    {
+        var matches = new List<int>();
+        for (var start = 0; start <= data.Length - pattern.Length; start++)
+        {
+            var matchesAtPosition = true;
+            for (var index = 0; index < pattern.Length; index++)
+            {
+                var left = data[start + index];
+                var right = pattern[index];
+                if (left is >= (byte)'A' and <= (byte)'Z') left += 32;
+                if (right is >= (byte)'A' and <= (byte)'Z') right += 32;
+                if (left != right)
+                {
+                    matchesAtPosition = false;
+                    break;
+                }
+            }
+            if (matchesAtPosition) matches.Add(start);
+        }
+        return matches;
+    }
+
+    private static FaceGenNifLayout ReadFaceGenNifLayout(byte[] nif)
+    {
+        var lineEnd = Array.IndexOf(nif, (byte)'\n');
+        if (lineEnd <= 0 || lineEnd > 128)
+            throw new InvalidDataException("The selected FaceGen mesh has an invalid NIF header.");
+        var versionText = Encoding.ASCII.GetString(nif, 0, lineEnd);
+        if (!versionText.StartsWith("Gamebryo File Format, Version ", StringComparison.Ordinal) &&
+            !versionText.StartsWith("NetImmerse File Format, Version ", StringComparison.Ordinal))
+            throw new InvalidDataException("The selected FaceGen mesh is not a supported Skyrim NIF file.");
+
+        var position = lineEnd + 1;
+        var fileVersion = ReadUInt32(nif, ref position);
+        if (fileVersion != 0x14020007)
+            throw new InvalidDataException($"Galathil can only rekey Skyrim FaceGen NIF 20.2.0.7 safely; this mesh uses version 0x{fileVersion:X8}.");
+        if (ReadByte(nif, ref position) != 1)
+            throw new InvalidDataException("Galathil cannot rekey a big-endian FaceGen NIF.");
+
+        var userVersion = ReadUInt32(nif, ref position);
+        var blockCount = ReadInt32(nif, ref position);
+        var streamVersion = ReadUInt32(nif, ref position);
+        if (!((userVersion == 11 && streamVersion == 83) || (userVersion == 12 && streamVersion == 100)))
+            throw new InvalidDataException($"Galathil cannot rekey FaceGen NIF user/stream version {userVersion}/{streamVersion} safely.");
+        if (blockCount < 1 || blockCount > 1_000_000)
+            throw new InvalidDataException("The selected FaceGen mesh has an invalid block count.");
+
+        SkipByteSizedString(nif, ref position);
+        SkipByteSizedString(nif, ref position);
+        SkipByteSizedString(nif, ref position);
+
+        var blockTypeCount = ReadUInt16(nif, ref position);
+        if (blockTypeCount == 0 || blockTypeCount > blockCount)
+            throw new InvalidDataException("The selected FaceGen mesh has an invalid block-type table.");
+        var blockTypes = new string[blockTypeCount];
+        for (var index = 0; index < blockTypeCount; index++)
+        {
+            var length = ReadInt32(nif, ref position);
+            EnsureAvailable(nif, position, length);
+            blockTypes[index] = Encoding.ASCII.GetString(nif, position, length);
+            position += length;
+        }
+        var blockTypeIndexes = new ushort[blockCount];
+        for (var index = 0; index < blockCount; index++)
+        {
+            var type = ReadUInt16(nif, ref position);
+            if (type >= blockTypeCount) throw new InvalidDataException("The selected FaceGen mesh has an invalid block type.");
+            blockTypeIndexes[index] = type;
+        }
+
+        var blockSizeOffsets = new int[blockCount];
+        var blockSizes = new int[blockCount];
+        long totalBlockBytes = 0;
+        for (var index = 0; index < blockCount; index++)
+        {
+            blockSizeOffsets[index] = position;
+            blockSizes[index] = ReadInt32(nif, ref position);
+            if (blockSizes[index] < 0) throw new InvalidDataException("The selected FaceGen mesh has a negative block size.");
+            totalBlockBytes += blockSizes[index];
+        }
+
+        var stringCount = ReadUInt32(nif, ref position);
+        _ = ReadUInt32(nif, ref position); // maximum header string length
+        if (stringCount > 1_000_000) throw new InvalidDataException("The selected FaceGen mesh has an invalid header string count.");
+        for (var index = 0; index < stringCount; index++) SkipSizedString(nif, ref position);
+
+        var groupCount = ReadInt32(nif, ref position);
+        if (groupCount < 0 || groupCount > 1_000_000)
+            throw new InvalidDataException("The selected FaceGen mesh has an invalid group count.");
+        EnsureAvailable(nif, position, checked(groupCount * sizeof(int)));
+        position += groupCount * sizeof(int);
+
+        if (totalBlockBytes > nif.Length - position)
+            throw new InvalidDataException("The selected FaceGen mesh's block sizes do not fit inside the file.");
+        var blocks = new List<NifBlockSpan>(blockCount);
+        var blockPosition = position;
+        for (var index = 0; index < blockCount; index++)
+        {
+            blocks.Add(new NifBlockSpan(blockPosition, blockSizes[index], blockTypes[blockTypeIndexes[index]]));
+            blockPosition = checked(blockPosition + blockSizes[index]);
+        }
+        return new FaceGenNifLayout(blocks, blockSizeOffsets);
+    }
+
+    private static void SkipByteSizedString(byte[] data, ref int position)
+    {
+        var length = ReadByte(data, ref position);
+        EnsureAvailable(data, position, length);
+        position += length;
+    }
+
+    private static void SkipSizedString(byte[] data, ref int position)
+    {
+        var length = ReadUInt32(data, ref position);
+        if (length > int.MaxValue) throw new InvalidDataException("The selected FaceGen mesh contains an oversized NIF string.");
+        EnsureAvailable(data, position, (int)length);
+        position += (int)length;
+    }
+
+    private static byte ReadByte(byte[] data, ref int position)
+    {
+        EnsureAvailable(data, position, 1);
+        return data[position++];
+    }
+
+    private static ushort ReadUInt16(byte[] data, ref int position)
+    {
+        EnsureAvailable(data, position, sizeof(ushort));
+        var value = BinaryPrimitives.ReadUInt16LittleEndian(data.AsSpan(position, sizeof(ushort)));
+        position += sizeof(ushort);
+        return value;
+    }
+
+    private static uint ReadUInt32(byte[] data, ref int position)
+    {
+        EnsureAvailable(data, position, sizeof(uint));
+        var value = BinaryPrimitives.ReadUInt32LittleEndian(data.AsSpan(position, sizeof(uint)));
+        position += sizeof(uint);
+        return value;
+    }
+
+    private static int ReadInt32(byte[] data, ref int position)
+    {
+        EnsureAvailable(data, position, sizeof(int));
+        var value = BinaryPrimitives.ReadInt32LittleEndian(data.AsSpan(position, sizeof(int)));
+        position += sizeof(int);
+        return value;
+    }
+
+    private static void EnsureAvailable(byte[] data, int position, int length)
+    {
+        if (position < 0 || length < 0 || position > data.Length - length)
+            throw new InvalidDataException("The selected FaceGen mesh has truncated NIF data.");
+    }
+
     private static void ValidateWrittenFaceGen(string root, IReadOnlyDictionary<FormKey, FaceGenFiles> expected)
     {
         foreach (var (key, files) in expected)
@@ -1445,31 +2187,6 @@ internal static class NpcAppearanceGenerator
                 !File.ReadAllBytes(tintPath).AsSpan().SequenceEqual(files.Tint))
                 throw new InvalidDataException($"Generated FaceGen files do not match the selected appearance for {FormKeyText(key)}.");
         }
-    }
-
-    private static string BuildSkyPatcherConfig(IReadOnlyList<(PreparedAssignment Assignment, FormKey CloneKey)> assignments, string pluginName)
-    {
-        var lines = new List<string>
-        {
-            "; Generated by Galathil. The appearance clone is stored in the source ESP.",
-            "; These rules copy the clone's visual style to the chosen NPC."
-        };
-        foreach (var (item, cloneKey) in assignments)
-        {
-            var cloneIdentifier = pluginName + "|" + cloneKey.ID.ToString("X8", CultureInfo.InvariantCulture);
-            var targetIdentifier = item.Target.FormKey.ModKey.FileName + "|" + item.Target.FormKey.ID.ToString("X8", CultureInfo.InvariantCulture);
-            var parts = new List<string> { "filterByNpcs=" + targetIdentifier, "filterByTemplate=" + targetIdentifier, "restrictToTemplateFlags=traits" };
-            parts.Add("copyVisualStyle=" + cloneIdentifier);
-            var transferOutfit = item.CopyOutfit ? item.Source.DefaultOutfit?.FormKeyNullable : null;
-            if (transferOutfit.HasValue)
-                parts.Add("outfitDefault=" + FormKeyIdentifier(transferOutfit.Value));
-            lines.Add(string.Join(':', parts));
-            if (item.CopySkinArmor && item.Source.WornArmor is { IsNull: false } skin)
-                lines.Add("filterByNpcs=" + targetIdentifier + ":skin=" + skin.FormKey.ModKey.FileName + "|" + skin.FormKey.ID.ToString("X8", CultureInfo.InvariantCulture));
-            if (item.CopyRace)
-                lines.Add("filterByNpcs=" + targetIdentifier + ":race=" + item.Source.Race.FormKey.ModKey.FileName + "|" + item.Source.Race.FormKey.ID.ToString("X8", CultureInfo.InvariantCulture));
-        }
-        return string.Join(Environment.NewLine, lines) + Environment.NewLine;
     }
 
     private static void ValidateLightPlugin(ISkyrimMod output, IReadOnlySet<FormKey> createdNpcKeys)
@@ -1485,27 +2202,6 @@ internal static class NpcAppearanceGenerator
                 throw new InvalidDataException($"The source plugin already contains NPC {npc.FormKey} outside the ESL local FormID range. Galathil will not rewrite this invalid light plugin.");
             }
         }
-    }
-
-    private static FormKey FindFreeLightFormKey(ISkyrimMod output)
-    {
-        var usedIds = new HashSet<uint>();
-        foreach (var property in output.GetType().GetProperties(System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance))
-        {
-            if (!property.CanRead || property.GetIndexParameters().Length != 0 || property.Name == "ModHeader") continue;
-            if (property.GetValue(output) is not System.Collections.IEnumerable records) continue;
-            foreach (var record in records.Cast<object?>().OfType<IMajorRecordGetter>())
-            {
-                if (record.FormKey.ModKey == output.ModKey) usedIds.Add(record.FormKey.ID);
-            }
-        }
-
-        for (uint id = 0x800; id <= LastLightObjectId; id++)
-        {
-            if (!usedIds.Contains(id)) return new FormKey(output.ModKey, id);
-        }
-
-        throw new LightPluginFormIdCapacityException(new FormKey(output.ModKey, output.NextFormID));
     }
 
     private static void ValidateWrittenPlugin(
@@ -1587,6 +2283,126 @@ internal static class NpcAppearanceGenerator
         }
     }
 
+    private static FaceGenFiles ReadLegacyGalathilFaceGenBackup(string sourceMod, FormKey donorKey, ICollection<string> warnings)
+    {
+        var backupRoot = Path.Combine(AppContext.BaseDirectory, "Backups", SafeFileStem(sourceMod));
+        if (!Directory.Exists(backupRoot))
+            throw new FileNotFoundException($"The older Galathil route is missing its helper FaceGen, and no backup folder exists for {sourceMod}.");
+
+        var meshRelative = FaceGenRelative(MeshFolder, donorKey, ".nif").Replace('\\', '/');
+        var tintRelative = FaceGenRelative(TintFolder, donorKey, ".dds").Replace('\\', '/');
+        foreach (var backupDirectory in Directory.EnumerateDirectories(backupRoot).OrderBy(path => Path.GetFileName(path), StringComparer.OrdinalIgnoreCase))
+        {
+            var archivePath = Path.Combine(backupDirectory, "source-files.zip");
+            if (!File.Exists(archivePath)) continue;
+            try
+            {
+                using var archive = ZipFile.OpenRead(archivePath);
+                var info = archive.GetEntry("backup-info.txt");
+                if (info is null) continue;
+                using var infoReader = new StreamReader(info.Open(), Encoding.UTF8);
+                if (!infoReader.ReadToEnd().Contains(FormKeyText(donorKey), StringComparison.OrdinalIgnoreCase)) continue;
+                var meshEntry = archive.Entries.FirstOrDefault(entry => entry.FullName.Replace('\\', '/').Equals(meshRelative, StringComparison.OrdinalIgnoreCase));
+                var tintEntry = archive.Entries.FirstOrDefault(entry => entry.FullName.Replace('\\', '/').Equals(tintRelative, StringComparison.OrdinalIgnoreCase));
+                if (meshEntry is null || tintEntry is null) continue;
+                var mesh = ReadZipEntry(meshEntry);
+                var tint = ReadZipEntry(tintEntry);
+                FaceGenAssetResolver.ValidateFaceGen(mesh, tint, donorKey);
+                warnings.Add($"Recovered the old replacer's FaceGen from Galathil backup '{Path.GetFileName(backupDirectory)}' while converting its previous SkyPatcher setup.");
+                return new FaceGenFiles(mesh, tint);
+            }
+            catch (Exception ex) when (ex is IOException or InvalidDataException or ArgumentException)
+            {
+                Debug.WriteLine($"Could not read legacy Galathil FaceGen backup '{archivePath}': {ex.Message}");
+            }
+        }
+
+        throw new FileNotFoundException($"The old Galathil appearance helper is missing valid FaceGen for {FormKeyText(donorKey)}, and Galathil could not find it in this mod's backups.");
+
+        static byte[] ReadZipEntry(ZipArchiveEntry entry)
+        {
+            using var input = entry.Open();
+            using var output = new MemoryStream();
+            input.CopyTo(output);
+            return output.ToArray();
+        }
+    }
+
+    private static Dictionary<string, byte[]> CollectInPlaceFilesToRemove(
+        string sourceModFolder,
+        string sourcePlugin,
+        IReadOnlyList<PreparedAssignment> assignments,
+        IReadOnlySet<FormKey> targetKeys)
+    {
+        var files = new Dictionary<string, byte[]>(StringComparer.OrdinalIgnoreCase);
+        foreach (var item in assignments)
+        {
+            if (!targetKeys.Contains(item.Source.FormKey)) AddFaceGen(item.Source.FormKey);
+            if (item.Appearance.FormKey != item.Source.FormKey &&
+                StringComparer.OrdinalIgnoreCase.Equals(item.Appearance.FormKey.ModKey.FileName.ToString(), sourcePlugin) &&
+                item.Appearance.EditorID?.StartsWith("GALATHIL_", StringComparison.OrdinalIgnoreCase) == true &&
+                !targetKeys.Contains(item.Appearance.FormKey))
+                AddFaceGen(item.Appearance.FormKey);
+        }
+
+        var generatedConfigRelative = Path.Combine("SKSE", "Plugins", "SkyPatcher", "npc",
+            "Galathil_" + SafeFileStem(Path.GetFileNameWithoutExtension(sourcePlugin)) + ".ini");
+        var generatedConfigPath = Path.Combine(sourceModFolder, generatedConfigRelative);
+        if (File.Exists(generatedConfigPath) &&
+            File.ReadLines(generatedConfigPath).Take(4).Any(line => line.Contains("Generated by Galathil", StringComparison.OrdinalIgnoreCase)))
+            files[generatedConfigRelative] = File.ReadAllBytes(generatedConfigPath);
+        return files;
+
+        void AddFaceGen(FormKey key)
+        {
+            foreach (var relative in new[]
+            {
+                FaceGenRelative(MeshFolder, key, ".nif"),
+                FaceGenRelative(TintFolder, key, ".dds")
+            })
+            {
+                var fullPath = Path.GetFullPath(Path.Combine(sourceModFolder, relative));
+                if (!IsChildPath(sourceModFolder, fullPath) || !File.Exists(fullPath)) continue;
+                files.TryAdd(relative, File.ReadAllBytes(fullPath));
+            }
+        }
+    }
+
+    private static void ValidateRemovedNpcRecords(string pluginPath, IReadOnlySet<FormKey> removedKeys)
+    {
+        if (removedKeys.Count == 0) return;
+        using var mod = SkyrimMod.CreateFromBinaryOverlay(pluginPath, SkyrimRelease.SkyrimSE);
+        var remaining = mod.Npcs.FirstOrDefault(n => removedKeys.Contains(n.FormKey));
+        if (remaining is not null)
+            throw new InvalidDataException($"Galathil left obsolete NPC record {FormKeyText(remaining.FormKey)} in the converted replacer ESP.");
+    }
+
+    private static void ValidateRemovedDonorFaceGen(string sourceModFolder, IReadOnlyList<PreparedAssignment> assignments, IReadOnlySet<FormKey> targetKeys)
+    {
+        foreach (var item in assignments)
+        {
+            if (!targetKeys.Contains(item.Source.FormKey)) EnsureRemoved(item.Source.FormKey);
+            if (item.Appearance.FormKey != item.Source.FormKey &&
+                StringComparer.OrdinalIgnoreCase.Equals(item.Appearance.FormKey.ModKey.FileName.ToString(), item.Assignment.SourcePlugin) &&
+                item.Appearance.EditorID?.StartsWith("GALATHIL_", StringComparison.OrdinalIgnoreCase) == true &&
+                !targetKeys.Contains(item.Appearance.FormKey))
+                EnsureRemoved(item.Appearance.FormKey);
+        }
+
+        void EnsureRemoved(FormKey key)
+        {
+            foreach (var relative in new[]
+            {
+                FaceGenRelative(MeshFolder, key, ".nif"),
+                FaceGenRelative(TintFolder, key, ".dds")
+            })
+            {
+                if (File.Exists(Path.Combine(sourceModFolder, relative)))
+                    throw new InvalidDataException($"Galathil could not remove the obsolete donor FaceGen file {relative}.");
+            }
+        }
+    }
+
     private static void ReplaceFileAtomically(string source, string destination)
     {
         Directory.CreateDirectory(Path.GetDirectoryName(destination)!);
@@ -1655,6 +2471,22 @@ internal static class NpcAppearanceGenerator
             !fullCandidate.Equals(fullRoot, StringComparison.OrdinalIgnoreCase);
     }
 
+    private static bool IsPluginAvailable(string modsPath, string dataPath, IReadOnlyList<GalathilModEntry> modOrder,
+        IReadOnlySet<string> activePlugins, IReadOnlyDictionary<string, string> pluginPaths, string pluginName)
+    {
+        if (activePlugins.Contains(pluginName) && pluginPaths.TryGetValue(pluginName, out var activePath) && File.Exists(activePath))
+            return true;
+        if (File.Exists(Path.Combine(dataPath, pluginName))) return true;
+        foreach (var mod in modOrder)
+        {
+            var folder = Path.GetFullPath(Path.Combine(modsPath, mod.Name));
+            if (IsChildPath(modsPath, folder) && Directory.Exists(folder) &&
+                PluginFileAccess.FindInModFolder(folder, pluginName) is not null)
+                return true;
+        }
+        return false;
+    }
+
     private static void RemoveSupersededModsFromProfile(string profilePath, IReadOnlyList<SupersededMod> mods)
     {
         if (mods.Count == 0) return;
@@ -1701,16 +2533,15 @@ internal static class NpcAppearanceGenerator
         return value[..separator].Trim() + "|" + id.ToString("X", CultureInfo.InvariantCulture);
     }
 
+    private static bool IsAddedNpcFormKey(string formKey, string sourcePlugin)
+    {
+        var separator = formKey.LastIndexOf('|');
+        return separator > 0 && formKey[..separator].Trim().Equals(sourcePlugin, StringComparison.OrdinalIgnoreCase);
+    }
+
     private sealed record SupersededMod(string Name, string Folder, string[] Plugins);
 
     private static bool IsPluginFile(string path) => Path.GetExtension(path).ToLowerInvariant() is ".esp" or ".esm" or ".esl";
-
-    private static string MakeEditorId(INpcGetter source, FormKey cloneKey)
-    {
-        var name = Regex.Replace(source.EditorID ?? "NPC", "[^A-Za-z0-9_]", "_");
-        if (name.Length > 30) name = name[..30];
-        return $"GALATHIL_{name}_{cloneKey.ID:X3}";
-    }
 
     private static string FormKeyText(FormKey key) => $"{key.ModKey.FileName}|{key.ID:X}";
 
@@ -1718,13 +2549,16 @@ internal static class NpcAppearanceGenerator
     private sealed record PreparedAssignment(
         AppearanceAssignment Assignment,
         Npc Source,
+        Npc Appearance,
         Npc BeforeSource,
         Npc Target,
         FaceGenFiles SourceFaceGen,
-        FaceGenFiles PreviousFaceGen,
         bool CopyRace,
         bool CopySkinArmor,
         bool CopyOutfit);
+    private sealed record NifBlockSpan(int Start, int Length, string Type);
+    private sealed record FaceGenNifLayout(IReadOnlyList<NifBlockSpan> Blocks, IReadOnlyList<int> BlockSizeOffsets);
+    private sealed record NifTexturePathReplacement(int LengthOffset, int DataOffset, int OldLength, byte[] NewBytes, int BlockIndex);
     private sealed record SharedPreparedAssignment(
         AppearanceAssignment Assignment,
         Npc Source,
@@ -1732,11 +2566,22 @@ internal static class NpcAppearanceGenerator
         Npc BeforeSource,
         Npc Target,
         FaceGenFiles SourceFaceGen,
-        FaceGenFiles? PreviousFaceGen,
-        bool RestoreSource,
+        bool CopyRace,
+        bool CopyGender,
         bool CopySkinArmor,
         bool CopyOutfit);
-    private sealed record FaceGenFiles(byte[] Mesh, byte[] Tint);
+    private sealed record SharedOutputRule(
+        SharedPreparedAssignment Item,
+        string PluginName,
+        IReadOnlyDictionary<FormKey, FormKey> CopiedRecords);
+    private sealed record FaceGenFiles(
+        byte[] Mesh,
+        byte[] Tint,
+        string? MeshSourcePath = null,
+        string? TintSourcePath = null,
+        bool SourceIsArchived = false,
+        bool FromGalathilOutput = false,
+        FormKey? PreviousTarget = null);
 
     private sealed class FaceGenAssetResolver
     {
@@ -1767,52 +2612,163 @@ internal static class NpcAppearanceGenerator
             var tintRelative = FaceGenRelative(TintFolder, key, ".dds");
             var sourceIndex = _modOrder.ToList().FindIndex(m => m.Name.Equals(sourceMod, StringComparison.OrdinalIgnoreCase));
             if (sourceIndex < 0) throw new InvalidOperationException($"MO2 mod '{sourceMod}' is missing from its mod list.");
-
-            var meshConflict = FindLooseConflictAfter(meshRelative, sourceIndex);
-            var tintConflict = FindLooseConflictAfter(tintRelative, sourceIndex);
-            // A later MO2 loose-file winner is what the game actually displays. Use
-            // that file for the transfer instead of rejecting an otherwise valid look.
-            var meshWinner = FindLooseWinner(meshRelative, meshConflict is null ? sourceIndex : int.MaxValue, skipGenerated: true);
-            var tintWinner = FindLooseWinner(tintRelative, tintConflict is null ? sourceIndex : int.MaxValue, skipGenerated: true);
-            if (meshConflict is not null)
-                warnings?.Add($"FaceGen mesh for {FormKeyText(key)} is overridden by '{meshWinner?.ModName ?? meshConflict}'. Galathil used the active MO2 winner.");
-            if (tintConflict is not null)
-                warnings?.Add($"FaceGen tint for {FormKeyText(key)} is overridden by '{tintWinner?.ModName ?? tintConflict}'. Galathil used the active MO2 winner.");
-
             var sourceFolder = Path.Combine(_modsPath, sourceMod);
-            var meshBytes = ReadLoose(meshWinner?.Path) ?? ReadFromModArchives(sourceFolder, meshRelative);
-            var tintBytes = ReadLoose(tintWinner?.Path) ?? ReadFromModArchives(sourceFolder, tintRelative);
-            if (meshBytes is null || tintBytes is null)
-                throw new FileNotFoundException($"The selected replacer does not provide both FaceGen files for {FormKeyText(key)}. Galathil needs its face mesh and tint to move the look.");
-            ValidateFaceGen(meshBytes, tintBytes, key);
-            return new FaceGenFiles(meshBytes, tintBytes);
+            var meshPath = Path.Combine(sourceFolder, meshRelative);
+            var tintPath = Path.Combine(sourceFolder, tintRelative);
+            var meshBytes = ReadLoose(meshPath);
+            var tintBytes = ReadLoose(tintPath);
+            if (meshBytes is not null && tintBytes is not null)
+            {
+                ValidateFaceGen(meshBytes, tintBytes, key);
+                AddLaterConflictWarning(meshRelative, tintRelative);
+                return new FaceGenFiles(meshBytes, tintBytes, meshPath, tintPath);
+            }
+
+            var archivedMesh = ReadFromModArchives(sourceFolder, meshRelative);
+            var archivedTint = ReadFromModArchives(sourceFolder, tintRelative);
+            if (archivedMesh is not null && archivedTint is not null)
+            {
+                ValidateFaceGen(archivedMesh, archivedTint, key);
+                AddLaterConflictWarning(meshRelative, tintRelative);
+                return new FaceGenFiles(archivedMesh, archivedTint, SourceIsArchived: true);
+            }
+
+            throw new FileNotFoundException($"The selected replacer mod does not contain both of its own FaceGen files for {FormKeyText(key)}. Galathil will not borrow another mod's files for the transfer.");
+
+            void AddLaterConflictWarning(string meshPathRelative, string tintPathRelative)
+            {
+                var meshConflict = FindLooseConflictAfter(meshPathRelative, sourceIndex);
+                var tintConflict = FindLooseConflictAfter(tintPathRelative, sourceIndex);
+                if (meshConflict is not null || tintConflict is not null)
+                {
+                    var names = new[] { meshConflict, tintConflict }.Where(name => name is not null).Distinct(StringComparer.OrdinalIgnoreCase);
+                    warnings?.Add($"Another MO2 mod ({string.Join(", ", names)}) also supplies donor-ID FaceGen. Galathil will use and remove only {sourceMod}'s files; the other mod's donor files will remain untouched.");
+                }
+            }
         }
 
-        public FaceGenFiles ReadEarlierFaceGen(string sourceMod, string previousPlugin, FormKey key)
+        public bool HasArchivedFaceGen(string sourceMod, FormKey key)
+        {
+            var sourceFolder = Path.Combine(_modsPath, sourceMod);
+            return ReadFromModArchives(sourceFolder, FaceGenRelative(MeshFolder, key, ".nif")) is not null ||
+                ReadFromModArchives(sourceFolder, FaceGenRelative(TintFolder, key, ".dds")) is not null;
+        }
+
+        public void EnsureRecipientFaceGenWillWin(string assetMod, FormKey targetKey, string targetName,
+            IReadOnlyDictionary<string, byte[]?>? planned = null)
+        {
+            var assetIndex = _modOrder.ToList().FindIndex(mod => mod.Name.Equals(assetMod, StringComparison.OrdinalIgnoreCase));
+            if (assetIndex < 0) throw new InvalidOperationException($"MO2 mod '{assetMod}' is missing from its mod list.");
+            if (!_modOrder[assetIndex].Enabled)
+                throw new InvalidOperationException($"The asset mod '{assetMod}' is disabled in this MO2 profile.");
+
+            var relativePaths = new[]
+            {
+                FaceGenRelative(MeshFolder, targetKey, ".nif"),
+                FaceGenRelative(TintFolder, targetKey, ".dds")
+            };
+            var conflicts = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            for (var index = assetIndex + 1; index < _modOrder.Count; index++)
+            {
+                var mod = _modOrder[index];
+                if (!mod.Enabled || IsGeneratedOutputMod(mod.Name)) continue;
+                var folder = Path.Combine(_modsPath, mod.Name);
+                if (relativePaths.Any(relative => ExistsAfterTransfer(Path.Combine(folder, relative))))
+                    conflicts.Add(mod.Name);
+            }
+
+            if (conflicts.Count > 0)
+                throw new InvalidOperationException($"Another higher-priority MO2 mod ({string.Join(", ", conflicts)}) supplies FaceGen for {targetName}. Move '{assetMod}' below it in MO2's left pane or resolve that asset conflict before applying.");
+
+            bool ExistsAfterTransfer(string path) => planned is not null && planned.TryGetValue(Path.GetFullPath(path), out var bytes)
+                ? bytes is not null
+                : File.Exists(path);
+        }
+
+        public FaceGenFiles ReadSharedOutputFaceGen(string sourceMod, FormKey key, FormKey? previousTarget,
+            IReadOnlyDictionary<string, string> previousFaceGen, ICollection<string> warnings)
         {
             var meshRelative = FaceGenRelative(MeshFolder, key, ".nif");
             var tintRelative = FaceGenRelative(TintFolder, key, ".dds");
             var sourceIndex = _modOrder.ToList().FindIndex(m => m.Name.Equals(sourceMod, StringComparison.OrdinalIgnoreCase));
-            var meshWinner = FindLooseWinner(meshRelative, sourceIndex - 1);
-            var tintWinner = FindLooseWinner(tintRelative, sourceIndex - 1);
-            var previousPluginFolder = _pluginPaths.TryGetValue(previousPlugin, out var previousPath)
-                ? Path.GetDirectoryName(previousPath)
-                : null;
-            var meshBytes = ReadLoose(meshWinner?.Path)
-                ?? ReadLoose(Path.Combine(_dataPath, meshRelative))
-                ?? (previousPluginFolder is null || previousPluginFolder.Equals(_dataPath, StringComparison.OrdinalIgnoreCase) ? null : ReadFromModArchives(previousPluginFolder, meshRelative))
-                ?? ReadFromGameArchives(key.ModKey, meshRelative);
-            var tintBytes = ReadLoose(tintWinner?.Path)
-                ?? ReadLoose(Path.Combine(_dataPath, tintRelative))
-                ?? (previousPluginFolder is null || previousPluginFolder.Equals(_dataPath, StringComparison.OrdinalIgnoreCase) ? null : ReadFromModArchives(previousPluginFolder, tintRelative))
-                ?? ReadFromGameArchives(key.ModKey, tintRelative);
-            if (meshBytes is null || tintBytes is null)
-                throw new FileNotFoundException($"Could not find the earlier FaceGen mesh and tint for {FormKeyText(key)}. Galathil cannot restore the NPC without those files.");
-            ValidateFaceGen(meshBytes, tintBytes, key);
-            return new FaceGenFiles(meshBytes, tintBytes);
+            if (sourceIndex < 0) throw new InvalidOperationException($"MO2 mod '{sourceMod}' is missing from its mod list.");
+
+            var sourceFolder = Path.Combine(_modsPath, sourceMod);
+            var selectedMeshPath = Path.Combine(sourceFolder, meshRelative);
+            var selectedTintPath = Path.Combine(sourceFolder, tintRelative);
+            var meshWinner = FindLooseWinner(meshRelative, int.MaxValue, skipGenerated: true, includePath: IsUnmanaged);
+            var tintWinner = FindLooseWinner(tintRelative, int.MaxValue, skipGenerated: true, includePath: IsUnmanaged);
+            if (meshWinner is { } meshConflict && meshConflict.Index > sourceIndex && !meshConflict.ModName.Equals(sourceMod, StringComparison.OrdinalIgnoreCase))
+                warnings?.Add($"A later MO2 mod ('{meshConflict.ModName}') also has {FormKeyText(key)}'s FaceGen mesh. Galathil transfers the selected mod's copy; the later mod will continue to supply its own mesh for the source NPC.");
+            if (tintWinner is { } tintConflict && tintConflict.Index > sourceIndex && !tintConflict.ModName.Equals(sourceMod, StringComparison.OrdinalIgnoreCase))
+                warnings?.Add($"A later MO2 mod ('{tintConflict.ModName}') also has {FormKeyText(key)}'s FaceGen tint. Galathil transfers the selected mod's copy; the later mod will continue to supply its own tint for the source NPC.");
+
+            var selectedMesh = IsUnmanaged(selectedMeshPath) ? ReadLoose(selectedMeshPath) : null;
+            var selectedTint = IsUnmanaged(selectedTintPath) ? ReadLoose(selectedTintPath) : null;
+            if (selectedMesh is not null && selectedTint is not null)
+            {
+                ValidateFaceGen(selectedMesh, selectedTint, key);
+                return new FaceGenFiles(selectedMesh, selectedTint,
+                    File.Exists(selectedMeshPath) ? selectedMeshPath : null,
+                    File.Exists(selectedTintPath) ? selectedTintPath : null);
+            }
+
+            if (previousTarget is { } previousKey)
+            {
+                var previousAssetMesh = Path.Combine(sourceFolder, FaceGenRelative(MeshFolder, previousKey, ".nif"));
+                var previousAssetTint = Path.Combine(sourceFolder, FaceGenRelative(TintFolder, previousKey, ".dds"));
+                var previousAssetMeshBytes = ReadLoose(previousAssetMesh);
+                var previousAssetTintBytes = ReadLoose(previousAssetTint);
+                if (previousAssetMeshBytes is not null && previousAssetTintBytes is not null)
+                {
+                    ValidateFaceGen(previousAssetMeshBytes, previousAssetTintBytes, previousKey);
+                    return new FaceGenFiles(previousAssetMeshBytes, previousAssetTintBytes,
+                        previousAssetMesh, previousAssetTint, PreviousTarget: previousKey);
+                }
+
+                var outputFolder = Path.Combine(_modsPath, OutputModName);
+                var previousMesh = Path.Combine(outputFolder, FaceGenRelative(MeshFolder, previousKey, ".nif"));
+                var previousTint = Path.Combine(outputFolder, FaceGenRelative(TintFolder, previousKey, ".dds"));
+                var meshBytes = ReadLoose(previousMesh);
+                var tintBytes = ReadLoose(previousTint);
+                if (meshBytes is not null && tintBytes is not null)
+                {
+                    ValidateFaceGen(meshBytes, tintBytes, key);
+                    return new FaceGenFiles(meshBytes, tintBytes, FromGalathilOutput: true, PreviousTarget: previousKey);
+                }
+            }
+
+            var meshArchived = selectedMesh is null;
+            var tintArchived = selectedTint is null;
+            selectedMesh ??= ReadFromModArchives(sourceFolder, meshRelative);
+            selectedTint ??= ReadFromModArchives(sourceFolder, tintRelative);
+            if (selectedMesh is not null && selectedTint is not null)
+            {
+                ValidateFaceGen(selectedMesh, selectedTint, key);
+                return new FaceGenFiles(selectedMesh, selectedTint,
+                    File.Exists(selectedMeshPath) ? selectedMeshPath : null,
+                    File.Exists(selectedTintPath) ? selectedTintPath : null,
+                    meshArchived || tintArchived);
+            }
+
+            // Preserve compatibility with replacers that ship FaceGen only in a
+            // separate winning asset mod. Those external files are copied, never
+            // removed, because they do not belong to the selected source mod.
+            var meshFallback = ReadLoose(meshWinner?.Path);
+            var tintFallback = ReadLoose(tintWinner?.Path);
+            if (meshFallback is null || tintFallback is null)
+                throw new FileNotFoundException($"The selected replacer does not provide both FaceGen files for {FormKeyText(key)}. Galathil needs its face mesh and tint to move the look.");
+            if (meshWinner is { } meshOwner && !meshOwner.ModName.Equals(sourceMod, StringComparison.OrdinalIgnoreCase))
+                warnings?.Add($"The selected mod does not contain {FormKeyText(key)}'s loose FaceGen; Galathil copied the active winner from '{meshOwner.ModName}' and left that mod unchanged.");
+            ValidateFaceGen(meshFallback, tintFallback, key);
+            return new FaceGenFiles(meshFallback, tintFallback);
+
+            bool IsUnmanaged(string path) => !previousFaceGen.TryGetValue(Path.GetFullPath(path), out var hash) ||
+                !File.Exists(path) || !HashMatches(File.ReadAllBytes(path), hash);
         }
 
-        private (string ModName, int Index, string Path)? FindLooseWinner(string relative, int lastIndex = int.MaxValue, bool skipGenerated = false)
+        private (string ModName, int Index, string Path)? FindLooseWinner(string relative, int lastIndex = int.MaxValue,
+            bool skipGenerated = false, Func<string, bool>? includePath = null)
         {
             (string ModName, int Index, string Path)? winner = null;
             var end = Math.Min(lastIndex, _modOrder.Count - 1);
@@ -1822,7 +2778,7 @@ internal static class NpcAppearanceGenerator
                 if (!mod.Enabled) continue;
                 if (skipGenerated && IsGeneratedOutputMod(mod.Name)) continue;
                 var path = Path.Combine(_modsPath, mod.Name, relative);
-                if (File.Exists(path)) winner = (mod.Name, index, path);
+                if (File.Exists(path) && (includePath is null || includePath(path))) winner = (mod.Name, index, path);
             }
             return winner;
         }
@@ -1887,7 +2843,7 @@ internal static class NpcAppearanceGenerator
 
         private static string NormalizePath(string path) => path.Replace('/', '\\').TrimStart('\\');
 
-        private static void ValidateFaceGen(byte[] mesh, byte[] tint, FormKey key)
+        public static void ValidateFaceGen(byte[] mesh, byte[] tint, FormKey key)
         {
             if (mesh.Length < 64) throw new InvalidDataException($"FaceGen mesh for {FormKeyText(key)} is empty or incomplete.");
             if (tint.Length < 128 || tint[0] != (byte)'D' || tint[1] != (byte)'D' || tint[2] != (byte)'S' || tint[3] != (byte)' ')
